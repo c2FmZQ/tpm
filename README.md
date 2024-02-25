@@ -21,18 +21,12 @@ import (
 	"log"
 
 	"github.com/c2FmZQ/tpm"
-	legacy "github.com/google/go-tpm/legacy/tpm2"
 )
 
 const keyPassphrase = "foobar"
 
 func main() {
-	rwc, err := legacy.OpenTPM()
-	if err != nil {
-		log.Fatalf("OpenTPM: %v", err)
-	}
-
-	tpm, err := tpm.New(rwc, []byte(keyPassphrase))
+	tpm, err := tpm.New(nil, []byte(keyPassphrase))
 	if err != nil {
 		log.Fatalf("tpm.New: %v", err)
 	}

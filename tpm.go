@@ -49,6 +49,12 @@ import (
 
 // New returns a new TPM that's ready to use.
 func New(rwc io.ReadWriteCloser, passphrase []byte) (*TPM, error) {
+	if rwc == nil {
+		var err error
+		if rwc, err = legacy.OpenTPM(); err != nil {
+			return nil, err
+		}
+	}
 	tpm := &TPM{
 		rwc:        rwc,
 		passphrase: passphrase,
