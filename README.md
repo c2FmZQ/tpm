@@ -1,4 +1,4 @@
-# github.com/c2FmZQ/tpm
+# tpm
 
 This package is an abstraction on top of the go-tpm libraries to use a local
 TPM to create and use RSA keys that are bound to that TPM. The private keys
@@ -15,7 +15,6 @@ All keys are 2048-bit RSA and non-duplicable.
 package main
 
 import (
-	"context"
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -28,15 +27,12 @@ import (
 const keyPassphrase = "foobar"
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	rwc, err := legacy.OpenTPM()
 	if err != nil {
 		log.Fatalf("OpenTPM: %v", err)
 	}
 
-	tpm, err := tpm.New(ctx, rwc, []byte(keyPassphrase))
+	tpm, err := tpm.New(rwc, []byte(keyPassphrase))
 	if err != nil {
 		log.Fatalf("tpm.New: %v", err)
 	}
