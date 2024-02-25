@@ -92,7 +92,7 @@ type TPM struct {
 }
 
 // CreateKey creates a new RSA key and returns a saved TPM context. The TPM
-// context can be saved online. Use Key() to use the RSA key tied to the
+// context can be saved offline. Call Key() to use the RSA key tied to the
 // context. Any number of keys can be created.
 func (t *TPM) CreateKey() ([]byte, error) {
 	t.mu.Lock()
