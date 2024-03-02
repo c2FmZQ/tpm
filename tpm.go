@@ -22,21 +22,25 @@
 // SOFTWARE.
 
 // Package tpm is an abstraction on top of the go-tpm libraries to use a local
-// TPM to create and use RSA keys that are bound to that TPM. The private keys
-// can never be used without the TPM that was used to create them.
+// TPM to create and use RSA, ECC, and AES keys that are bound to that TPM. The
+// keys can never be used without the TPM that was used to create them.
 //
 // Any number of keys can be created and used concurrently. The library takes
 // care loading the right key in the TPM, as needed.
 //
-// All keys are 2048-bit RSA and non-duplicable.
+// By default, 2048-bit RSA keys are created. AES keys, ECC keys, and RSA keys
+// of different sizes can also be created if the TPM supports them.
 package tpm
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -45,7 +49,36 @@ import (
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpmutil"
+	"golang.org/x/crypto/cryptobyte"
+	"golang.org/x/crypto/cryptobyte/asn1"
 )
+
+const (
+	TypeRSA KeyType = 1
+	TypeECC KeyType = 2
+	TypeAES KeyType = 3
+)
+
+var (
+	ErrWrongKeyType = errors.New("operation not implemented with this key type")
+	ErrInvalidCurve = errors.New("invalid curve id")
+	ErrDecrypt      = errors.New("decryption error")
+)
+
+type KeyType int
+
+func (t KeyType) String() string {
+	switch t {
+	case TypeRSA:
+		return "RSA"
+	case TypeECC:
+		return "ECC"
+	case TypeAES:
+		return "AES"
+	default:
+		return ""
+	}
+}
 
 // New returns a new TPM that's ready to use.
 func New(rwc io.ReadWriteCloser, passphrase []byte) (*TPM, error) {
@@ -91,10 +124,53 @@ type TPM struct {
 	loadedHandle tpm2.TPMHandle
 }
 
-// CreateKey creates a new RSA key and returns a saved TPM context. The TPM
-// context can be saved offline. Call Key() to use the RSA key tied to the
-// context. Any number of keys can be created.
-func (t *TPM) CreateKey() ([]byte, error) {
+type createOptions struct {
+	keyType KeyType
+	bits    int
+	curve   elliptic.Curve
+}
+
+// Option is an option that can be passed to CreateKey.
+type Option func(*createOptions)
+
+// WithRSA indicates that an RSA key should be created.
+func WithRSA(bits int) Option {
+	return func(opts *createOptions) {
+		opts.keyType = TypeRSA
+		opts.bits = bits
+		opts.curve = nil
+	}
+}
+
+// WithECC indicates that an ECC key should be created.
+func WithECC(curve elliptic.Curve) Option {
+	return func(opts *createOptions) {
+		opts.keyType = TypeECC
+		opts.bits = 0
+		opts.curve = curve
+	}
+}
+
+// WithAES indicates that an AES key should be created.
+func WithAES(bits int) Option {
+	return func(opts *createOptions) {
+		opts.keyType = TypeAES
+		opts.bits = bits
+		opts.curve = nil
+	}
+}
+
+// CreateKey creates a new key and returns a saved TPM context. The TPM
+// context can be saved offline. Call Key() to use the key tied to the context.
+// Any number of keys can be created.
+func (t *TPM) CreateKey(opts ...Option) ([]byte, error) {
+	opt := createOptions{
+		keyType: TypeRSA,
+		bits:    2048,
+	}
+	for _, o := range opts {
+		o(&opt)
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	tpm := transport.FromReadWriter(t.rwc)
@@ -118,39 +194,138 @@ func (t *TPM) CreateKey() ([]byte, error) {
 	}
 	defer tpm2.FlushContext{FlushHandle: srk}.Execute(tpm)
 
-	unique = make([]byte, 256)
-	if _, err := io.ReadFull(rand.Reader, unique); err != nil {
-		return nil, fmt.Errorf("rand: %w", err)
-	}
-	rsaKeyTemplate := tpm2.TPMTPublic{
-		Type:    tpm2.TPMAlgRSA,
-		NameAlg: tpm2.TPMAlgSHA256,
-		ObjectAttributes: tpm2.TPMAObject{
-			FixedTPM:             true,
-			STClear:              false,
-			FixedParent:          true,
-			SensitiveDataOrigin:  true,
-			UserWithAuth:         true,
-			AdminWithPolicy:      false,
-			NoDA:                 false,
-			EncryptedDuplication: false,
-			Restricted:           false,
-			Decrypt:              true,
-			SignEncrypt:          true,
-		},
-		Parameters: tpm2.NewTPMUPublicParms(
-			tpm2.TPMAlgRSA,
-			&tpm2.TPMSRSAParms{
-				KeyBits: 2048,
+	var public tpm2.TPMTPublic
+
+	switch opt.keyType {
+	case TypeRSA:
+		unique := make([]byte, opt.bits/8)
+		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
+			return nil, fmt.Errorf("rand: %w", err)
+		}
+		public = tpm2.TPMTPublic{
+			Type:    tpm2.TPMAlgRSA,
+			NameAlg: tpm2.TPMAlgSHA256,
+			ObjectAttributes: tpm2.TPMAObject{
+				FixedTPM:             true,
+				STClear:              false,
+				FixedParent:          true,
+				SensitiveDataOrigin:  true,
+				UserWithAuth:         true,
+				AdminWithPolicy:      false,
+				NoDA:                 false,
+				EncryptedDuplication: false,
+				Restricted:           false,
+				Decrypt:              true,
+				SignEncrypt:          true,
 			},
-		),
-		Unique: tpm2.NewTPMUPublicID(
-			tpm2.TPMAlgRSA,
-			&tpm2.TPM2BPublicKeyRSA{
-				Buffer: unique,
+			Parameters: tpm2.NewTPMUPublicParms(
+				tpm2.TPMAlgRSA,
+				&tpm2.TPMSRSAParms{
+					KeyBits: tpm2.TPMKeyBits(opt.bits),
+				},
+			),
+			Unique: tpm2.NewTPMUPublicID(
+				tpm2.TPMAlgRSA,
+				&tpm2.TPM2BPublicKeyRSA{
+					Buffer: unique,
+				},
+			),
+		}
+
+	case TypeECC:
+		unique := make([]byte, 64)
+		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
+			return nil, fmt.Errorf("rand: %w", err)
+		}
+		var curve tpm2.TPMECCCurve
+		var hash tpm2.TPMAlgID
+		switch opt.curve {
+		case elliptic.P224():
+			curve = tpm2.TPMECCNistP224
+			hash = tpm2.TPMAlgSHA256
+		case elliptic.P256():
+			curve = tpm2.TPMECCNistP256
+			hash = tpm2.TPMAlgSHA256
+		case elliptic.P384():
+			curve = tpm2.TPMECCNistP384
+			hash = tpm2.TPMAlgSHA384
+		case elliptic.P521():
+			curve = tpm2.TPMECCNistP521
+			hash = tpm2.TPMAlgSHA512
+		default:
+			return nil, ErrInvalidCurve
+		}
+		public = tpm2.TPMTPublic{
+			Type:    tpm2.TPMAlgECC,
+			NameAlg: hash,
+			ObjectAttributes: tpm2.TPMAObject{
+				FixedTPM:             true,
+				STClear:              false,
+				FixedParent:          true,
+				SensitiveDataOrigin:  true,
+				UserWithAuth:         true,
+				AdminWithPolicy:      false,
+				NoDA:                 false,
+				EncryptedDuplication: false,
+				Restricted:           false,
+				Decrypt:              true,
+				SignEncrypt:          true,
 			},
-		),
+			Parameters: tpm2.NewTPMUPublicParms(
+				tpm2.TPMAlgECC,
+				&tpm2.TPMSECCParms{
+					CurveID: curve,
+				},
+			),
+			Unique: tpm2.NewTPMUPublicID(
+				tpm2.TPMAlgECC,
+				&tpm2.TPMSECCPoint{
+					X: tpm2.TPM2BECCParameter{Buffer: unique[:32]},
+					Y: tpm2.TPM2BECCParameter{Buffer: unique[32:]},
+				},
+			),
+		}
+
+	case TypeAES:
+		unique := make([]byte, 32)
+		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
+			return nil, fmt.Errorf("rand: %w", err)
+		}
+		public = tpm2.TPMTPublic{
+			Type:    tpm2.TPMAlgSymCipher,
+			NameAlg: tpm2.TPMAlgSHA256,
+			ObjectAttributes: tpm2.TPMAObject{
+				FixedTPM:             true,
+				STClear:              false,
+				FixedParent:          true,
+				SensitiveDataOrigin:  true,
+				UserWithAuth:         true,
+				AdminWithPolicy:      false,
+				NoDA:                 false,
+				EncryptedDuplication: false,
+				Restricted:           false,
+				Decrypt:              true,
+				SignEncrypt:          true,
+			},
+			Parameters: tpm2.NewTPMUPublicParms(
+				tpm2.TPMAlgSymCipher,
+				&tpm2.TPMSSymCipherParms{
+					Sym: tpm2.TPMTSymDefObject{
+						Algorithm: tpm2.TPMAlgAES,
+						KeyBits:   tpm2.NewTPMUSymKeyBits(tpm2.TPMAlgAES, tpm2.TPMKeyBits(opt.bits)),
+						Mode:      tpm2.NewTPMUSymMode(tpm2.TPMAlgAES, tpm2.TPMAlgCFB),
+					},
+				},
+			),
+			Unique: tpm2.NewTPMUPublicID(
+				tpm2.TPMAlgSymCipher,
+				&tpm2.TPM2BDigest{Buffer: unique},
+			),
+		}
+	default:
+		return nil, ErrWrongKeyType
 	}
+
 	createResp, err := tpm2.Create{
 		ParentHandle: srk,
 		InSensitive: tpm2.TPM2BSensitiveCreate{
@@ -160,7 +335,7 @@ func (t *TPM) CreateKey() ([]byte, error) {
 				},
 			},
 		},
-		InPublic: tpm2.New2B(rsaKeyTemplate),
+		InPublic: tpm2.New2B(public),
 	}.Execute(tpm)
 	if err != nil {
 		return nil, fmt.Errorf("TPM2_Create: %w", err)
@@ -189,13 +364,17 @@ func (t *TPM) CreateKey() ([]byte, error) {
 func (t *TPM) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.flushLocked()
+	return t.rwc.Close()
+}
+
+func (t *TPM) flushLocked() {
 	if t.loadedKey != "" {
 		tpm := transport.FromReadWriter(t.rwc)
 		tpm2.FlushContext{FlushHandle: t.loadedHandle}.Execute(tpm)
 		t.loadedKey = ""
 		t.loadedHandle = 0
 	}
-	return t.rwc.Close()
 }
 
 // Key returns the Key tied to the saved TPM context.
@@ -212,17 +391,27 @@ func (t *TPM) Key(savedContext []byte) (*Key, error) {
 		id:  hex.EncodeToString(hashed[:]),
 		key: *key,
 	}
+	if t.loadedKey == out.id {
+		t.flushLocked()
+	}
+	if err := out.loadLocked(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
+var _ crypto.Decrypter = (*Key)(nil)
 var _ crypto.Signer = (*Key)(nil)
 
-// Key executes the expected RSA operations via the TPM. It implements the
-// [crypto.Signer] interface.
+// Key executes the expected operations via the TPM. It implements the
+// [crypto.Signer] and [crypto.Decrypter] interfaces.
 type Key struct {
 	t         *TPM
 	id        string
 	key       tpm2.TPMSContext
+	keyType   KeyType
+	bits      int
+	curve     elliptic.Curve
 	publicKey crypto.PublicKey
 }
 
@@ -230,12 +419,8 @@ func (k *Key) loadLocked() error {
 	if k.t.loadedKey == k.id {
 		return nil
 	}
+	k.t.flushLocked()
 	tpm := transport.FromReadWriter(k.t.rwc)
-	if k.t.loadedKey != "" {
-		tpm2.FlushContext{FlushHandle: k.t.loadedHandle}.Execute(tpm)
-		k.t.loadedKey = ""
-		k.t.loadedHandle = 0
-	}
 	contextLoadResp, err := tpm2.ContextLoad{Context: k.key}.Execute(tpm)
 	if err != nil {
 		return fmt.Errorf("TPM2_ContextLoad: %w", err)
@@ -243,38 +428,82 @@ func (k *Key) loadLocked() error {
 	k.t.loadedKey = k.id
 	k.t.loadedHandle = contextLoadResp.LoadedHandle
 	if k.publicKey == nil {
-		pub, err := k.publicLocked()
-		if err != nil {
+		if err := k.getPublicLocked(); err != nil {
 			return err
 		}
-		k.publicKey = pub
 	}
 	return nil
 }
 
-func (k *Key) publicLocked() (crypto.PublicKey, error) {
+func (k *Key) getPublicLocked() error {
 	tpm := transport.FromReadWriter(k.t.rwc)
 	readPublicResp, err := tpm2.ReadPublic{ObjectHandle: k.t.loadedHandle}.Execute(tpm)
 	if err != nil {
-		return nil, fmt.Errorf("TPM2_ReadPublic: %w", err)
+		return fmt.Errorf("TPM2_ReadPublic: %w", err)
 	}
 	outPublic, err := readPublicResp.OutPublic.Contents()
 	if err != nil {
-		return nil, fmt.Errorf("TPM2_ReadPublic: %w", err)
+		return fmt.Errorf("TPM2_ReadPublic: %w", err)
 	}
-	rsaParms, err := outPublic.Parameters.RSADetail()
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_ReadPublic: %w", err)
+
+	switch tpm2.TPMAlgID(outPublic.Type) {
+	case tpm2.TPMAlgRSA:
+		rsaParms, err := outPublic.Parameters.RSADetail()
+		if err != nil {
+			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+		}
+		rsaPubKeyN, err := outPublic.Unique.RSA()
+		if err != nil {
+			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+		}
+		rsaPubKey, err := tpm2.RSAPub(rsaParms, rsaPubKeyN)
+		if err != nil {
+			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+		}
+		k.publicKey = rsaPubKey
+		k.keyType = TypeRSA
+		k.bits = int(rsaParms.KeyBits)
+
+	case tpm2.TPMAlgECC:
+		eccParms, err := outPublic.Parameters.ECCDetail()
+		if err != nil {
+			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+		}
+		c, err := tpm2.TPMECCCurve(eccParms.CurveID).Curve()
+		if err != nil {
+			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+		}
+		eccPoint, err := outPublic.Unique.ECC()
+		if err != nil {
+			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+		}
+		eccPubKey, err := tpm2.ECCPub(eccParms, eccPoint)
+		if err != nil {
+			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+		}
+		k.publicKey = &ecdsa.PublicKey{
+			Curve: eccPubKey.Curve,
+			X:     eccPubKey.X,
+			Y:     eccPubKey.Y,
+		}
+		k.keyType = TypeECC
+		k.curve = c
+
+	case tpm2.TPMAlgSymCipher:
+		symParms, err := outPublic.Parameters.SymDetail()
+		if err != nil {
+			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+		}
+		if symParms.Sym.Algorithm == tpm2.TPMAlgAES {
+			bits, err := symParms.Sym.KeyBits.AES()
+			if err != nil {
+				return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			}
+			k.keyType = TypeAES
+			k.bits = int(*bits)
+		}
 	}
-	rsaPubKeyN, err := outPublic.Unique.RSA()
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_ReadPublic: %w", err)
-	}
-	rsaPubKey, err := tpm2.RSAPub(rsaParms, rsaPubKeyN)
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_ReadPublic: %w", err)
-	}
-	return rsaPubKey, nil
+	return nil
 }
 
 // Public returns the public key.
@@ -287,57 +516,168 @@ func (k *Key) Public() crypto.PublicKey {
 	return k.publicKey
 }
 
-// Sign signs a digest with the RSA key.
+// Type returns the key type.
+func (k *Key) Type() KeyType {
+	k.t.mu.Lock()
+	defer k.t.mu.Unlock()
+	if err := k.loadLocked(); err != nil {
+		return 0
+	}
+	return k.keyType
+}
+
+// Bits returns the key size.
+func (k *Key) Bits() int {
+	k.t.mu.Lock()
+	defer k.t.mu.Unlock()
+	if err := k.loadLocked(); err != nil {
+		return 0
+	}
+	return k.bits
+}
+
+// Curve returns the key curve ID.
+func (k *Key) Curve() elliptic.Curve {
+	k.t.mu.Lock()
+	defer k.t.mu.Unlock()
+	if err := k.loadLocked(); err != nil {
+		return nil
+	}
+	return k.curve
+}
+
+// Sign signs a digest with the key (RSA only).
 func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
 	k.t.mu.Lock()
 	defer k.t.mu.Unlock()
 	if err := k.loadLocked(); err != nil {
 		return nil, err
 	}
+	switch k.keyType {
+	case TypeRSA:
+		hashAlg, err := legacy.HashToAlgorithm(opts.HashFunc())
+		if err != nil {
+			return nil, err
+		}
+		scheme := legacy.SigScheme{
+			Alg:  legacy.AlgRSASSA,
+			Hash: hashAlg,
+		}
+		if pss, ok := opts.(*rsa.PSSOptions); ok {
+			scheme.Alg = legacy.AlgRSAPSS
+			scheme.Count = uint32(pss.SaltLength)
+		}
+		sig, err := legacy.Sign(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.passphrase), digest, nil, &scheme)
+		if err != nil {
+			return nil, fmt.Errorf("TPM2_Sign: %w", err)
+		}
+		return sig.RSA.Signature, nil
 
-	hashAlg, err := legacy.HashToAlgorithm(opts.HashFunc())
-	if err != nil {
-		return nil, err
+	case TypeECC:
+		hashAlg, err := legacy.HashToAlgorithm(opts.HashFunc())
+		if err != nil {
+			return nil, err
+		}
+		scheme := legacy.SigScheme{
+			Alg:  legacy.AlgECDSA,
+			Hash: hashAlg,
+		}
+		sig, err := legacy.Sign(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.passphrase), digest, nil, &scheme)
+		if err != nil {
+			return nil, fmt.Errorf("TPM2_Sign: %w", err)
+		}
+		var b cryptobyte.Builder
+		b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
+			addASN1IntBytes(b, sig.ECC.R.Bytes())
+			addASN1IntBytes(b, sig.ECC.S.Bytes())
+		})
+		return b.Bytes()
+
+	default:
+		return nil, ErrWrongKeyType
 	}
-	scheme := legacy.SigScheme{
-		Alg:  legacy.AlgRSASSA,
-		Hash: hashAlg,
-	}
-	if pss, ok := opts.(*rsa.PSSOptions); ok {
-		scheme.Alg = legacy.AlgRSAPSS
-		scheme.Count = uint32(pss.SaltLength)
-	}
-	sig, err := legacy.Sign(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.passphrase), digest, nil, &scheme)
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_Sign: %w", err)
-	}
-	return sig.RSA.Signature, nil
 }
 
-// Encrypt encrypts cleartext with the RSA key.
-func (k *Key) Encrypt(cleartext []byte) ([]byte, error) {
+// Copied from crypto/ecdsa/ecdsa.go
+// https://cs.opensource.google/go/go/+/refs/tags/go1.22.0:src/crypto/ecdsa/ecdsa.go;l=347
+// Copyright (c) 2009 The Go Authors. All rights reserved.
+// https://cs.opensource.google/go/go/+/master:LICENSE
+func addASN1IntBytes(b *cryptobyte.Builder, bytes []byte) {
+	for len(bytes) > 0 && bytes[0] == 0 {
+		bytes = bytes[1:]
+	}
+	if len(bytes) == 0 {
+		b.SetError(errors.New("invalid integer"))
+		return
+	}
+	b.AddASN1(asn1.INTEGER, func(c *cryptobyte.Builder) {
+		if bytes[0]&0x80 != 0 {
+			c.AddUint8(0)
+		}
+		c.AddBytes(bytes)
+	})
+}
+
+// Encrypt encrypts cleartext with the key.
+func (k *Key) Encrypt(cleartext []byte) (ciphertext []byte, err error) {
 	k.t.mu.Lock()
 	defer k.t.mu.Unlock()
 	if err := k.loadLocked(); err != nil {
 		return nil, err
 	}
-	enc, err := legacy.RSAEncrypt(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), cleartext, &legacy.AsymScheme{Alg: legacy.AlgOAEP, Hash: legacy.AlgSHA256}, "")
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_RSAEncrypt: %w", err)
+	switch k.keyType {
+	case TypeRSA:
+		enc, err := legacy.RSAEncrypt(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), cleartext, &legacy.AsymScheme{Alg: legacy.AlgOAEP, Hash: legacy.AlgSHA256}, "")
+		if err != nil {
+			return nil, fmt.Errorf("TPM2_RSAEncrypt: %w", err)
+		}
+		return enc, nil
+
+	case TypeAES:
+		iv := make([]byte, 16)
+		if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+			return nil, fmt.Errorf("rand: %w", err)
+		}
+		enc, err := legacy.EncryptSymmetric(k.t.rwc, string(k.t.passphrase), tpmutil.Handle(k.t.loadedHandle), iv, cleartext)
+		if err != nil {
+			return nil, fmt.Errorf("TPM2_EncryptSymmetric: %w", err)
+		}
+		out := make([]byte, len(iv)+len(enc))
+		copy(out, iv)
+		copy(out[len(iv):], enc)
+		return out, nil
+
+	default:
+		return nil, ErrWrongKeyType
 	}
-	return enc, nil
 }
 
-// Decrypt decrypts ciphertext with the RSA key.
-func (k *Key) Decrypt(ciphertext []byte) ([]byte, error) {
+// Decrypt decrypts ciphertext with the key.
+func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (plaintext []byte, err error) {
 	k.t.mu.Lock()
 	defer k.t.mu.Unlock()
 	if err := k.loadLocked(); err != nil {
 		return nil, err
 	}
-	dec, err := legacy.RSADecrypt(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.passphrase), ciphertext, &legacy.AsymScheme{Alg: legacy.AlgOAEP, Hash: legacy.AlgSHA256}, "")
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_RSADecrypt: %w", err)
+	switch k.keyType {
+	case TypeRSA:
+		dec, err := legacy.RSADecrypt(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.passphrase), ciphertext, &legacy.AsymScheme{Alg: legacy.AlgOAEP, Hash: legacy.AlgSHA256}, "")
+		if err != nil {
+			return nil, fmt.Errorf("TPM2_RSADecrypt: %w", err)
+		}
+		return dec, nil
+
+	case TypeAES:
+		if len(ciphertext) < 16 {
+			return nil, ErrDecrypt
+		}
+		dec, err := legacy.DecryptSymmetric(k.t.rwc, string(k.t.passphrase), tpmutil.Handle(k.t.loadedHandle), ciphertext[:16], ciphertext[16:])
+		if err != nil {
+			return nil, fmt.Errorf("TPM2_DecryptSymmetric: %w", err)
+		}
+		return dec, nil
+
+	default:
+		return nil, ErrWrongKeyType
 	}
-	return dec, nil
 }

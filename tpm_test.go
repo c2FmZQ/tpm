@@ -25,6 +25,8 @@ package tpm
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha256"
 	"testing"
@@ -32,7 +34,7 @@ import (
 	"github.com/google/go-tpm-tools/simulator"
 )
 
-func TestTPM(t *testing.T) {
+func TestRSA(t *testing.T) {
 	const (
 		keyPassphrase = "blah"
 		payload       = "Hello World!"
@@ -40,7 +42,7 @@ func TestTPM(t *testing.T) {
 
 	rwc, err := simulator.Get()
 	if err != nil {
-		t.Fatalf("failed to initialize simulator: %v", err)
+		t.Fatalf("simulator.Get: %v", err)
 	}
 
 	tpm, err := New(rwc, []byte(keyPassphrase))
@@ -49,48 +51,163 @@ func TestTPM(t *testing.T) {
 	}
 	defer tpm.Close()
 
-	keyctx, err := tpm.CreateKey()
+	for _, size := range []int{1024, 2048} {
+		keyctx, err := tpm.CreateKey(WithRSA(size))
+		if err != nil {
+			t.Fatalf("tpm.CreateKey: %v", err)
+		}
+
+		key, err := tpm.Key(keyctx)
+		if err != nil {
+			t.Fatalf("tpm.Key: %v", err)
+		}
+
+		if got, want := key.Type(), TypeRSA; got != want {
+			t.Fatalf("key.Type() = %d, want %d", got, want)
+		}
+		if got, want := key.Bits(), size; got != want {
+			t.Fatalf("key.Bits() = %d, want %d", got, want)
+		}
+		enc, err := key.Encrypt([]byte(payload))
+		if err != nil {
+			t.Fatalf("tpm.Encrypt: %v", err)
+		}
+		dec, err := key.Decrypt(nil, enc, nil)
+		if err != nil {
+			t.Fatalf("tpm.Decrypt: %v", err)
+		}
+		if got, want := string(dec), payload; got != want {
+			t.Fatalf("Decrypt() = %q, want %q", got, want)
+		}
+
+		pub := key.Public()
+		hashed := sha256.Sum256([]byte(payload))
+		sig, err := key.Sign(nil, hashed[:], crypto.SHA256)
+		if err != nil {
+			t.Fatalf("Sign(): %v", err)
+		}
+		if err := rsa.VerifyPKCS1v15(pub.(*rsa.PublicKey), crypto.SHA256, hashed[:], sig); err != nil {
+			t.Fatalf("VerifyPKCS1v15: %v", err)
+		}
+		pssOptions := &rsa.PSSOptions{SaltLength: 32, Hash: crypto.SHA256}
+		sig2, err := key.Sign(nil, hashed[:], pssOptions)
+		if err != nil {
+			t.Fatalf("Sign(): %v", err)
+		}
+		if err := rsa.VerifyPSS(pub.(*rsa.PublicKey), crypto.SHA256, hashed[:], sig2, pssOptions); err != nil {
+			t.Fatalf("VerifyPSS: %v", err)
+		}
+
+		tpm.passphrase = []byte("wrong")
+		if _, err := key.Decrypt(nil, enc, nil); err == nil {
+			t.Fatal("tpm.Decrypt should have failed")
+		}
+		tpm.passphrase = []byte(keyPassphrase)
+	}
+}
+
+func TestECC(t *testing.T) {
+	const (
+		keyPassphrase = "blah"
+		payload       = "Hello World!"
+	)
+
+	rwc, err := simulator.Get()
 	if err != nil {
-		t.Fatalf("tpm.CreateKey: %v", err)
+		t.Fatalf("simulator.Get: %v", err)
 	}
 
-	key, err := tpm.Key(keyctx)
+	tpm, err := New(rwc, []byte(keyPassphrase))
 	if err != nil {
-		t.Fatalf("tpm.Key: %v", err)
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	for _, curve := range []elliptic.Curve{
+		elliptic.P224(),
+		elliptic.P256(),
+		elliptic.P384(),
+		elliptic.P521(),
+	} {
+		keyctx, err := tpm.CreateKey(WithECC(curve))
+		if err != nil {
+			t.Fatalf("tpm.CreateKey: %v", err)
+		}
+
+		key, err := tpm.Key(keyctx)
+		if err != nil {
+			t.Fatalf("tpm.Key: %v", err)
+		}
+
+		if got, want := key.Type(), TypeECC; got != want {
+			t.Fatalf("key.Type() = %d, want %d", got, want)
+		}
+		if got, want := key.Curve(), curve; got != want {
+			t.Fatalf("key.Curve() = %v, want %v", got, want)
+		}
+
+		pub := key.Public()
+		hashed := sha256.Sum256([]byte(payload))
+		sig, err := key.Sign(nil, hashed[:], crypto.SHA256)
+		if err != nil {
+			t.Fatalf("Sign(): %v", err)
+		}
+		if !ecdsa.VerifyASN1(pub.(*ecdsa.PublicKey), hashed[:], sig) {
+			t.Fatal("VerifyASN1 failed")
+		}
+	}
+}
+
+func TestAES(t *testing.T) {
+	const (
+		keyPassphrase = "blah"
+		payload       = "Hello World!"
+	)
+
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
 	}
 
-	enc, err := key.Encrypt([]byte(payload))
+	tpm, err := New(rwc, []byte(keyPassphrase))
 	if err != nil {
-		t.Fatalf("tpm.Encrypt: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	dec, err := key.Decrypt(enc)
-	if err != nil {
-		t.Fatalf("tpm.Decrypt: %v", err)
-	}
-	if got, want := string(dec), payload; got != want {
-		t.Fatalf("decrypt() = %q, want %q", got, want)
-	}
+	defer tpm.Close()
 
-	pub := key.Public()
-	hashed := sha256.Sum256([]byte(payload))
-	sig, err := key.Sign(nil, hashed[:], crypto.SHA256)
-	if err != nil {
-		t.Fatalf("Sign(): %v", err)
-	}
-	if err := rsa.VerifyPKCS1v15(pub.(*rsa.PublicKey), crypto.SHA256, hashed[:], sig); err != nil {
-		t.Fatalf("VerifyPKCS1v15: %v", err)
-	}
-	pssOptions := &rsa.PSSOptions{SaltLength: 32, Hash: crypto.SHA256}
-	sig2, err := key.Sign(nil, hashed[:], pssOptions)
-	if err != nil {
-		t.Fatalf("Sign(): %v", err)
-	}
-	if err := rsa.VerifyPSS(pub.(*rsa.PublicKey), crypto.SHA256, hashed[:], sig2, pssOptions); err != nil {
-		t.Fatalf("VerifyPSS: %v", err)
-	}
+	for _, size := range []int{128, 256} {
+		keyctx, err := tpm.CreateKey(WithAES(size))
+		if err != nil {
+			t.Fatalf("tpm.CreateKey: %v", err)
+		}
 
-	tpm.passphrase = []byte("wrong")
-	if _, err := key.Decrypt(enc); err == nil {
-		t.Fatal("tpm.Decrypt should have failed")
+		key, err := tpm.Key(keyctx)
+		if err != nil {
+			t.Fatalf("tpm.Key: %v", err)
+		}
+
+		if got, want := key.Type(), TypeAES; got != want {
+			t.Fatalf("key.Type() = %d, want %d", got, want)
+		}
+		if got, want := key.Bits(), size; got != want {
+			t.Fatalf("key.Bits() = %d, want %d", got, want)
+		}
+		enc, err := key.Encrypt([]byte(payload))
+		if err != nil {
+			t.Fatalf("tpm.Encrypt: %v", err)
+		}
+		dec, err := key.Decrypt(nil, enc, nil)
+		if err != nil {
+			t.Fatalf("tpm.Decrypt: %v", err)
+		}
+		if got, want := string(dec), payload; got != want {
+			t.Fatalf("Decrypt() = %q, want %q", got, want)
+		}
+
+		tpm.passphrase = []byte("wrong")
+		if _, err := key.Decrypt(nil, enc, nil); err == nil {
+			t.Fatal("tpm.Decrypt should have failed")
+		}
+		tpm.passphrase = []byte(keyPassphrase)
 	}
 }

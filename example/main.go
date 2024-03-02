@@ -35,7 +35,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("key.Encrypt: %v", err)
 	}
-	decrypted, err := key.Decrypt(encrypted)
+	decrypted, err := key.Decrypt(nil, encrypted, nil)
 	if err != nil {
 		log.Fatalf("key.Decrypt: %v", err)
 	}
