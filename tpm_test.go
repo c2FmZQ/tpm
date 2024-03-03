@@ -45,7 +45,7 @@ func TestRSA(t *testing.T) {
 		t.Fatalf("simulator.Get: %v", err)
 	}
 
-	tpm, err := New(rwc, []byte(keyPassphrase))
+	tpm, err := New(WithTPM(rwc), WithObjectAuth([]byte(keyPassphrase)))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -98,11 +98,11 @@ func TestRSA(t *testing.T) {
 			t.Fatalf("VerifyPSS: %v", err)
 		}
 
-		tpm.passphrase = []byte("wrong")
+		tpm.objectAuth = []byte("wrong")
 		if _, err := key.Decrypt(nil, enc, nil); err == nil {
 			t.Fatal("tpm.Decrypt should have failed")
 		}
-		tpm.passphrase = []byte(keyPassphrase)
+		tpm.objectAuth = []byte(keyPassphrase)
 	}
 }
 
@@ -117,7 +117,7 @@ func TestECC(t *testing.T) {
 		t.Fatalf("simulator.Get: %v", err)
 	}
 
-	tpm, err := New(rwc, []byte(keyPassphrase))
+	tpm, err := New(WithTPM(rwc), WithObjectAuth([]byte(keyPassphrase)))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestAES(t *testing.T) {
 		t.Fatalf("simulator.Get: %v", err)
 	}
 
-	tpm, err := New(rwc, []byte(keyPassphrase))
+	tpm, err := New(WithTPM(rwc), WithObjectAuth([]byte(keyPassphrase)))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -204,10 +204,10 @@ func TestAES(t *testing.T) {
 			t.Fatalf("Decrypt() = %q, want %q", got, want)
 		}
 
-		tpm.passphrase = []byte("wrong")
+		tpm.objectAuth = []byte("wrong")
 		if _, err := key.Decrypt(nil, enc, nil); err == nil {
 			t.Fatal("tpm.Decrypt should have failed")
 		}
-		tpm.passphrase = []byte(keyPassphrase)
+		tpm.objectAuth = []byte(keyPassphrase)
 	}
 }

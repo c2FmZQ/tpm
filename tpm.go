@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 
 	legacy "github.com/google/go-tpm/legacy/tpm2"
@@ -80,21 +81,46 @@ func (t KeyType) String() string {
 	}
 }
 
+// Option is an option that can be passed to New.
+type Option func(*TPM)
+
+// WithTPM specifies an already open TPM device to use.
+func WithTPM(rwc io.ReadWriteCloser) Option {
+	return func(t *TPM) {
+		t.rwc = rwc
+	}
+}
+
+// WithEndorsementAuth specifies the endorsement passphrase.
+func WithEndorsementAuth(pp []byte) Option {
+	return func(t *TPM) {
+		t.endorsementAuth = slices.Clone(pp)
+	}
+}
+
+// WithObjectAuth specifies the passphrase to set on created keys.
+func WithObjectAuth(pp []byte) Option {
+	return func(t *TPM) {
+		t.objectAuth = slices.Clone(pp)
+	}
+}
+
 // New returns a new TPM that's ready to use.
-func New(rwc io.ReadWriteCloser, passphrase []byte) (*TPM, error) {
-	if rwc == nil {
-		var err error
-		if rwc, err = legacy.OpenTPM(); err != nil {
+func New(opts ...Option) (*TPM, error) {
+	var tpm TPM
+	for _, o := range opts {
+		o(&tpm)
+	}
+	if tpm.rwc == nil {
+		rwc, err := legacy.OpenTPM()
+		if err != nil {
 			return nil, err
 		}
-	}
-	tpm := &TPM{
-		rwc:        rwc,
-		passphrase: passphrase,
+		tpm.rwc = rwc
 	}
 
 	// Flush any existing transient handles.
-	ttpm := transport.FromReadWriter(rwc)
+	ttpm := transport.FromReadWriter(tpm.rwc)
 	capResp, err := tpm2.GetCapability{
 		Capability:    tpm2.TPMCapHandles,
 		Property:      uint32(tpm2.TPMHTTransient) << 24,
@@ -110,32 +136,33 @@ func New(rwc io.ReadWriteCloser, passphrase []byte) (*TPM, error) {
 	for _, h := range handles.Handle {
 		tpm2.FlushContext{FlushHandle: h}.Execute(ttpm)
 	}
-	return tpm, nil
+	return &tpm, nil
 }
 
 // TPM uses a local Trusted Platform Module (TPM) device to create and use RSA
 // keys that are bound to that TPM. The private keys can never be used without
 // the TPM created them.
 type TPM struct {
-	mu           sync.Mutex
-	rwc          io.ReadWriteCloser
-	passphrase   []byte
-	loadedKey    string
-	loadedHandle tpm2.TPMHandle
+	mu              sync.Mutex
+	rwc             io.ReadWriteCloser
+	objectAuth      []byte
+	endorsementAuth []byte
+	loadedKey       string
+	loadedHandle    tpm2.TPMHandle
 }
 
-type createOptions struct {
+type keyOptions struct {
 	keyType KeyType
 	bits    int
 	curve   elliptic.Curve
 }
 
-// Option is an option that can be passed to CreateKey.
-type Option func(*createOptions)
+// KeyOption is an option that can be passed to CreateKey.
+type KeyOption func(*keyOptions)
 
 // WithRSA indicates that an RSA key should be created.
-func WithRSA(bits int) Option {
-	return func(opts *createOptions) {
+func WithRSA(bits int) KeyOption {
+	return func(opts *keyOptions) {
 		opts.keyType = TypeRSA
 		opts.bits = bits
 		opts.curve = nil
@@ -143,8 +170,8 @@ func WithRSA(bits int) Option {
 }
 
 // WithECC indicates that an ECC key should be created.
-func WithECC(curve elliptic.Curve) Option {
-	return func(opts *createOptions) {
+func WithECC(curve elliptic.Curve) KeyOption {
+	return func(opts *keyOptions) {
 		opts.keyType = TypeECC
 		opts.bits = 0
 		opts.curve = curve
@@ -152,8 +179,8 @@ func WithECC(curve elliptic.Curve) Option {
 }
 
 // WithAES indicates that an AES key should be created.
-func WithAES(bits int) Option {
-	return func(opts *createOptions) {
+func WithAES(bits int) KeyOption {
+	return func(opts *keyOptions) {
 		opts.keyType = TypeAES
 		opts.bits = bits
 		opts.curve = nil
@@ -163,8 +190,8 @@ func WithAES(bits int) Option {
 // CreateKey creates a new key and returns a saved TPM context. The TPM
 // context can be saved offline. Call Key() to use the key tied to the context.
 // Any number of keys can be created.
-func (t *TPM) CreateKey(opts ...Option) ([]byte, error) {
-	opt := createOptions{
+func (t *TPM) CreateKey(opts ...KeyOption) ([]byte, error) {
+	opt := keyOptions{
 		keyType: TypeRSA,
 		bits:    2048,
 	}
@@ -182,15 +209,18 @@ func (t *TPM) CreateKey(opts ...Option) ([]byte, error) {
 	inPubTempl := tpm2.RSASRKTemplate
 	inPubTempl.Unique = tpm2.NewTPMUPublicID(tpm2.TPMAlgRSA, &tpm2.TPM2BPublicKeyRSA{Buffer: unique})
 	createPrimaryResp, err := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.TPMRHEndorsement,
-		InPublic:      tpm2.New2B(inPubTempl),
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHEndorsement,
+			Auth:   tpm2.PasswordAuth(t.endorsementAuth),
+		},
+		InPublic: tpm2.New2B(inPubTempl),
 	}.Execute(tpm)
 	if err != nil {
 		return nil, fmt.Errorf("TPM2_CreatePrimary: %w", err)
 	}
 	srk := tpm2.NamedHandle{
 		Handle: createPrimaryResp.ObjectHandle,
-		Name:   tpm2.TPM2BName{Buffer: []byte("SRK")},
+		Name:   createPrimaryResp.Name,
 	}
 	defer tpm2.FlushContext{FlushHandle: srk}.Execute(tpm)
 
@@ -331,7 +361,7 @@ func (t *TPM) CreateKey(opts ...Option) ([]byte, error) {
 		InSensitive: tpm2.TPM2BSensitiveCreate{
 			Sensitive: &tpm2.TPMSSensitiveCreate{
 				UserAuth: tpm2.TPM2BAuth{
-					Buffer: t.passphrase,
+					Buffer: t.objectAuth,
 				},
 			},
 		},
@@ -567,7 +597,7 @@ func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signatur
 			scheme.Alg = legacy.AlgRSAPSS
 			scheme.Count = uint32(pss.SaltLength)
 		}
-		sig, err := legacy.Sign(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.passphrase), digest, nil, &scheme)
+		sig, err := legacy.Sign(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.objectAuth), digest, nil, &scheme)
 		if err != nil {
 			return nil, fmt.Errorf("TPM2_Sign: %w", err)
 		}
@@ -582,7 +612,7 @@ func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signatur
 			Alg:  legacy.AlgECDSA,
 			Hash: hashAlg,
 		}
-		sig, err := legacy.Sign(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.passphrase), digest, nil, &scheme)
+		sig, err := legacy.Sign(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.objectAuth), digest, nil, &scheme)
 		if err != nil {
 			return nil, fmt.Errorf("TPM2_Sign: %w", err)
 		}
@@ -638,7 +668,7 @@ func (k *Key) Encrypt(cleartext []byte) (ciphertext []byte, err error) {
 		if _, err := io.ReadFull(rand.Reader, iv); err != nil {
 			return nil, fmt.Errorf("rand: %w", err)
 		}
-		enc, err := legacy.EncryptSymmetric(k.t.rwc, string(k.t.passphrase), tpmutil.Handle(k.t.loadedHandle), iv, cleartext)
+		enc, err := legacy.EncryptSymmetric(k.t.rwc, string(k.t.objectAuth), tpmutil.Handle(k.t.loadedHandle), iv, cleartext)
 		if err != nil {
 			return nil, fmt.Errorf("TPM2_EncryptSymmetric: %w", err)
 		}
@@ -661,7 +691,7 @@ func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (p
 	}
 	switch k.keyType {
 	case TypeRSA:
-		dec, err := legacy.RSADecrypt(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.passphrase), ciphertext, &legacy.AsymScheme{Alg: legacy.AlgOAEP, Hash: legacy.AlgSHA256}, "")
+		dec, err := legacy.RSADecrypt(k.t.rwc, tpmutil.Handle(k.t.loadedHandle), string(k.t.objectAuth), ciphertext, &legacy.AsymScheme{Alg: legacy.AlgOAEP, Hash: legacy.AlgSHA256}, "")
 		if err != nil {
 			return nil, fmt.Errorf("TPM2_RSADecrypt: %w", err)
 		}
@@ -671,7 +701,7 @@ func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (p
 		if len(ciphertext) < 16 {
 			return nil, ErrDecrypt
 		}
-		dec, err := legacy.DecryptSymmetric(k.t.rwc, string(k.t.passphrase), tpmutil.Handle(k.t.loadedHandle), ciphertext[:16], ciphertext[16:])
+		dec, err := legacy.DecryptSymmetric(k.t.rwc, string(k.t.objectAuth), tpmutil.Handle(k.t.loadedHandle), ciphertext[:16], ciphertext[16:])
 		if err != nil {
 			return nil, fmt.Errorf("TPM2_DecryptSymmetric: %w", err)
 		}

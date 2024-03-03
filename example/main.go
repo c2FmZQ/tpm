@@ -12,7 +12,7 @@ import (
 const keyPassphrase = "foobar"
 
 func main() {
-	tpm, err := tpm.New(nil, []byte(keyPassphrase))
+	tpm, err := tpm.New(tpm.WithObjectAuth([]byte(keyPassphrase)))
 	if err != nil {
 		log.Fatalf("tpm.New: %v", err)
 	}
