@@ -139,9 +139,11 @@ func New(opts ...Option) (*TPM, error) {
 	return &tpm, nil
 }
 
-// TPM uses a local Trusted Platform Module (TPM) device to create and use RSA
-// keys that are bound to that TPM. The private keys can never be used without
-// the TPM created them.
+var _ io.Closer = (*TPM)(nil)
+
+// TPM uses a local Trusted Platform Module (TPM) device to create and use
+// cryptographic keys that are bound to that TPM. The keys can never be used
+// without the TPM created them.
 type TPM struct {
 	mu              sync.Mutex
 	rwc             io.ReadWriteCloser
@@ -187,10 +189,20 @@ func WithAES(bits int) KeyOption {
 	}
 }
 
-// CreateKey creates a new key and returns a saved TPM context. The TPM
-// context can be saved offline. Call Key() to use the key tied to the context.
-// Any number of keys can be created.
-func (t *TPM) CreateKey(opts ...KeyOption) ([]byte, error) {
+// CreateKey creates a new key that's ready to use. Keys can be serialized and
+// stored offline with [Key.Marshal], and restored with [TPM.UnmarshalKey]. The
+// serialized keys can only be restored using the same TPM.
+func (t *TPM) CreateKey(opts ...KeyOption) (*Key, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	b, err := t.createLocked(opts...)
+	if err != nil {
+		return nil, err
+	}
+	return t.unmarshalLocked(b)
+}
+
+func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 	opt := keyOptions{
 		keyType: TypeRSA,
 		bits:    2048,
@@ -198,8 +210,7 @@ func (t *TPM) CreateKey(opts ...KeyOption) ([]byte, error) {
 	for _, o := range opts {
 		o(&opt)
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.flushLocked()
 	tpm := transport.FromReadWriter(t.rwc)
 
 	unique := make([]byte, 256)
@@ -407,19 +418,25 @@ func (t *TPM) flushLocked() {
 	}
 }
 
-// Key returns the Key tied to the saved TPM context.
-func (t *TPM) Key(savedContext []byte) (*Key, error) {
+// UnmarshalKey returns the Key associated with the saved TPM context.
+func (t *TPM) UnmarshalKey(savedContext []byte) (*Key, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.unmarshalLocked(savedContext)
+}
+
+func (t *TPM) unmarshalLocked(savedContext []byte) (*Key, error) {
+	savedContext = slices.Clone(savedContext)
 	key, err := tpm2.Unmarshal[tpm2.TPMSContext](savedContext)
 	if err != nil {
 		return nil, fmt.Errorf("TPM2_Unmarshal: %w", err)
 	}
 	hashed := sha256.Sum256(savedContext)
 	out := &Key{
-		t:   t,
-		id:  hex.EncodeToString(hashed[:]),
-		key: *key,
+		t:    t,
+		id:   hex.EncodeToString(hashed[:]),
+		key:  *key,
+		keyb: savedContext,
 	}
 	if t.loadedKey == out.id {
 		t.flushLocked()
@@ -433,12 +450,13 @@ func (t *TPM) Key(savedContext []byte) (*Key, error) {
 var _ crypto.Decrypter = (*Key)(nil)
 var _ crypto.Signer = (*Key)(nil)
 
-// Key executes the expected operations via the TPM. It implements the
+// Key performs cryptographic operations via the TPM. It implements the
 // [crypto.Signer] and [crypto.Decrypter] interfaces.
 type Key struct {
 	t         *TPM
 	id        string
 	key       tpm2.TPMSContext
+	keyb      []byte
 	keyType   KeyType
 	bits      int
 	curve     elliptic.Curve
@@ -534,6 +552,12 @@ func (k *Key) getPublicLocked() error {
 		}
 	}
 	return nil
+}
+
+// Marshal returns the serialized version of the key, which can be stored
+// offline, and later unmarshaled with [TPM.UnmarshalKey].
+func (k *Key) Marshal() ([]byte, error) {
+	return k.keyb, nil
 }
 
 // Public returns the public key.

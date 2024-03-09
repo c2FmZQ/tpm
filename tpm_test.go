@@ -24,11 +24,13 @@
 package tpm
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha256"
+	"fmt"
 	"testing"
 
 	"github.com/google/go-tpm-tools/simulator"
@@ -52,14 +54,9 @@ func TestRSA(t *testing.T) {
 	defer tpm.Close()
 
 	for _, size := range []int{1024, 2048} {
-		keyctx, err := tpm.CreateKey(WithRSA(size))
+		key, err := tpm.CreateKey(WithRSA(size))
 		if err != nil {
 			t.Fatalf("tpm.CreateKey: %v", err)
-		}
-
-		key, err := tpm.Key(keyctx)
-		if err != nil {
-			t.Fatalf("tpm.Key: %v", err)
 		}
 
 		if got, want := key.Type(), TypeRSA; got != want {
@@ -129,14 +126,9 @@ func TestECC(t *testing.T) {
 		elliptic.P384(),
 		elliptic.P521(),
 	} {
-		keyctx, err := tpm.CreateKey(WithECC(curve))
+		key, err := tpm.CreateKey(WithECC(curve))
 		if err != nil {
 			t.Fatalf("tpm.CreateKey: %v", err)
-		}
-
-		key, err := tpm.Key(keyctx)
-		if err != nil {
-			t.Fatalf("tpm.Key: %v", err)
 		}
 
 		if got, want := key.Type(), TypeECC; got != want {
@@ -176,14 +168,9 @@ func TestAES(t *testing.T) {
 	defer tpm.Close()
 
 	for _, size := range []int{128, 256} {
-		keyctx, err := tpm.CreateKey(WithAES(size))
+		key, err := tpm.CreateKey(WithAES(size))
 		if err != nil {
 			t.Fatalf("tpm.CreateKey: %v", err)
-		}
-
-		key, err := tpm.Key(keyctx)
-		if err != nil {
-			t.Fatalf("tpm.Key: %v", err)
 		}
 
 		if got, want := key.Type(), TypeAES; got != want {
@@ -209,5 +196,66 @@ func TestAES(t *testing.T) {
 			t.Fatal("tpm.Decrypt should have failed")
 		}
 		tpm.objectAuth = []byte(keyPassphrase)
+	}
+}
+
+func TestMarshal(t *testing.T) {
+	const (
+		keyPassphrase = "blah"
+	)
+
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+
+	tpm, err := New(WithTPM(rwc), WithObjectAuth([]byte(keyPassphrase)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	var contexts [][]byte
+	var encrypted [][]byte
+	for i := 0; i < 10; i++ {
+		key, err := tpm.CreateKey()
+		if err != nil {
+			t.Fatalf("tpm.CreateKey: %v", err)
+		}
+		b, err := key.Marshal()
+		if err != nil {
+			t.Fatalf("key.Marshal: %v", err)
+		}
+		contexts = append(contexts, b)
+
+		payload := []byte(fmt.Sprintf("Payload %d", i))
+		enc, err := key.Encrypt(payload)
+		if err != nil {
+			t.Fatalf("tpm.Encrypt: %v", err)
+		}
+		encrypted = append(encrypted, enc)
+
+		dec, err := key.Decrypt(nil, enc, nil)
+		if err != nil {
+			t.Fatalf("tpm.Decrypt: %v", err)
+		}
+		if got, want := dec, payload; !bytes.Equal(got, want) {
+			t.Fatalf("tpm.Decrypt() = %q, want %q", got, want)
+		}
+	}
+
+	for i := 0; i < 100; i++ {
+		ctx := contexts[i%10]
+		key, err := tpm.UnmarshalKey(ctx)
+		if err != nil {
+			t.Fatalf("tpm.UnmarshalKey: %v", err)
+		}
+		dec, err := key.Decrypt(nil, encrypted[i%10], nil)
+		if err != nil {
+			t.Fatalf("tpm.Decrypt: %v", err)
+		}
+		if got, want := dec, []byte(fmt.Sprintf("Payload %d", i%10)); !bytes.Equal(got, want) {
+			t.Fatalf("tpm.Decrypt() = %q, want %q", got, want)
+		}
 	}
 }

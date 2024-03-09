@@ -32,17 +32,16 @@ func main() {
 	}
 	defer tpm.Close()
 
-	// CreateKey returns a []byte that can be saved offline.
-	keyctx, err := tpm.CreateKey()
+	key, err := tpm.CreateKey()
 	if err != nil {
 		log.Fatalf("tpm.CreateKey: %v", err)
 	}
-
-	key, err := tpm.Key(keyctx)
-	if err != nil {
-		log.Fatalf("tpm.Key: %v", err)
-	}
 	fmt.Printf("Key type: %s-%d\n\n", key.Type(), key.Bits())
+	b, err := key.Marshal()
+	if err != nil {
+		log.Fatalf("key.Marshal: %v", err)
+	}
+	fmt.Printf("Key context: %s\n\n", hex.EncodeToString(b))
 
 	payload := "Hello world!"
 	fmt.Printf("Payload: %q\n", payload)
