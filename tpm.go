@@ -213,27 +213,11 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 	t.flushLocked()
 	tpm := transport.FromReadWriter(t.rwc)
 
-	unique := make([]byte, 256)
-	if _, err := io.ReadFull(rand.Reader, unique); err != nil {
-		return nil, fmt.Errorf("rand: %w", err)
-	}
-	inPubTempl := tpm2.RSASRKTemplate
-	inPubTempl.Unique = tpm2.NewTPMUPublicID(tpm2.TPMAlgRSA, &tpm2.TPM2BPublicKeyRSA{Buffer: unique})
-	createPrimaryResp, err := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.AuthHandle{
-			Handle: tpm2.TPMRHEndorsement,
-			Auth:   tpm2.PasswordAuth(t.endorsementAuth),
-		},
-		InPublic: tpm2.New2B(inPubTempl),
-	}.Execute(tpm)
+	srk, flush, err := t.srk()
 	if err != nil {
-		return nil, fmt.Errorf("TPM2_CreatePrimary: %w", err)
+		return nil, err
 	}
-	srk := tpm2.NamedHandle{
-		Handle: createPrimaryResp.ObjectHandle,
-		Name:   createPrimaryResp.Name,
-	}
-	defer tpm2.FlushContext{FlushHandle: srk}.Execute(tpm)
+	defer flush()
 
 	var public tpm2.TPMTPublic
 
@@ -382,23 +366,16 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 		return nil, fmt.Errorf("TPM2_Create: %w", err)
 	}
 
-	loadResp, err := tpm2.Load{
-		ParentHandle: srk,
-		InPrivate:    createResp.OutPrivate,
-		InPublic:     createResp.OutPublic,
-	}.Execute(tpm)
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_Load: %w", err)
-	}
-	defer tpm2.FlushContext{FlushHandle: loadResp.ObjectHandle}.Execute(tpm)
+	priv := tpm2.Marshal(createResp.OutPrivate)
+	pub := tpm2.Marshal(createResp.OutPublic)
 
-	saveResp, err := tpm2.ContextSave{SaveHandle: loadResp.ObjectHandle}.Execute(tpm)
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_ContextSave: %w", err)
-	}
-	savedContext := tpm2.Marshal(saveResp.Context)
+	buf := cryptobyte.NewBuilder(nil)
+	buf.AddUint16(uint16(len(priv)))
+	buf.AddBytes(priv)
+	buf.AddUint16(uint16(len(pub)))
+	buf.AddBytes(pub)
 
-	return savedContext, nil
+	return buf.Bytes()
 }
 
 // Close closes the connections to the TPM.
@@ -418,25 +395,42 @@ func (t *TPM) flushLocked() {
 	}
 }
 
-// UnmarshalKey returns the Key associated with the saved TPM context.
-func (t *TPM) UnmarshalKey(savedContext []byte) (*Key, error) {
+// UnmarshalKey returns the Key associated with serialized data.
+func (t *TPM) UnmarshalKey(b []byte) (*Key, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.unmarshalLocked(savedContext)
+	return t.unmarshalLocked(b)
 }
 
-func (t *TPM) unmarshalLocked(savedContext []byte) (*Key, error) {
-	savedContext = slices.Clone(savedContext)
-	key, err := tpm2.Unmarshal[tpm2.TPMSContext](savedContext)
+func (t *TPM) unmarshalLocked(in []byte) (*Key, error) {
+	in = slices.Clone(in)
+	hashed := sha256.Sum256(in)
+
+	str := cryptobyte.String(in)
+	var sz uint16
+	var savedPriv []byte
+	if !str.ReadUint16(&sz) || !str.ReadBytes(&savedPriv, int(sz)) {
+		return nil, errors.New("parse error")
+	}
+	var savedPub []byte
+	if !str.ReadUint16(&sz) || !str.ReadBytes(&savedPub, int(sz)) {
+		return nil, errors.New("parse error")
+	}
+	priv, err := tpm2.Unmarshal[tpm2.TPM2BPrivate](savedPriv)
 	if err != nil {
 		return nil, fmt.Errorf("TPM2_Unmarshal: %w", err)
 	}
-	hashed := sha256.Sum256(savedContext)
+	pub, err := tpm2.Unmarshal[tpm2.TPM2BPublic](savedPub)
+	if err != nil {
+		return nil, fmt.Errorf("TPM2_Unmarshal: %w", err)
+	}
+
 	out := &Key{
 		t:    t,
 		id:   hex.EncodeToString(hashed[:]),
-		key:  *key,
-		keyb: savedContext,
+		priv: *priv,
+		pub:  *pub,
+		keyb: in,
 	}
 	if t.loadedKey == out.id {
 		t.flushLocked()
@@ -455,7 +449,8 @@ var _ crypto.Signer = (*Key)(nil)
 type Key struct {
 	t         *TPM
 	id        string
-	key       tpm2.TPMSContext
+	priv      tpm2.TPM2BPrivate
+	pub       tpm2.TPM2BPublic
 	keyb      []byte
 	keyType   KeyType
 	bits      int
@@ -469,12 +464,24 @@ func (k *Key) loadLocked() error {
 	}
 	k.t.flushLocked()
 	tpm := transport.FromReadWriter(k.t.rwc)
-	contextLoadResp, err := tpm2.ContextLoad{Context: k.key}.Execute(tpm)
+
+	srk, flush, err := k.t.srk()
 	if err != nil {
-		return fmt.Errorf("TPM2_ContextLoad: %w", err)
+		return err
 	}
+	defer flush()
+
+	loadResp, err := tpm2.Load{
+		ParentHandle: srk,
+		InPrivate:    k.priv,
+		InPublic:     k.pub,
+	}.Execute(tpm)
+	if err != nil {
+		return fmt.Errorf("TPM2_Load: %w", err)
+	}
+
 	k.t.loadedKey = k.id
-	k.t.loadedHandle = contextLoadResp.LoadedHandle
+	k.t.loadedHandle = loadResp.ObjectHandle
 	if k.publicKey == nil {
 		if err := k.getPublicLocked(); err != nil {
 			return err
@@ -734,4 +741,26 @@ func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (p
 	default:
 		return nil, ErrWrongKeyType
 	}
+}
+
+func (t *TPM) srk() (tpm2.NamedHandle, func(), error) {
+	tpm := transport.FromReadWriter(t.rwc)
+
+	createPrimaryResp, err := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHEndorsement,
+			Auth:   tpm2.PasswordAuth(t.endorsementAuth),
+		},
+		InPublic: tpm2.New2B(tpm2.RSASRKTemplate),
+	}.Execute(tpm)
+	if err != nil {
+		return tpm2.NamedHandle{}, nil, fmt.Errorf("TPM2_CreatePrimary: %w", err)
+	}
+	srk := tpm2.NamedHandle{
+		Handle: createPrimaryResp.ObjectHandle,
+		Name:   createPrimaryResp.Name,
+	}
+	return srk, func() {
+		tpm2.FlushContext{FlushHandle: srk}.Execute(tpm)
+	}, nil
 }

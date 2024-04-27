@@ -41,7 +41,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("key.Marshal: %v", err)
 	}
-	fmt.Printf("Key context: %s\n\n", hex.EncodeToString(b))
+	fmt.Printf("Saved key: %s\n\n", hex.EncodeToString(b))
 
 	payload := "Hello world!"
 	fmt.Printf("Payload: %q\n", payload)
