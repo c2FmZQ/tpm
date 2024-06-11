@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"slices"
 	"sync"
 
@@ -532,14 +533,10 @@ func (k *Key) getPublicLocked() error {
 		if err != nil {
 			return fmt.Errorf("TPM2_ReadPublic: %w", err)
 		}
-		eccPubKey, err := tpm2.ECCPub(eccParms, eccPoint)
-		if err != nil {
-			return fmt.Errorf("TPM2_ReadPublic: %w", err)
-		}
 		k.publicKey = &ecdsa.PublicKey{
-			Curve: eccPubKey.Curve,
-			X:     eccPubKey.X,
-			Y:     eccPubKey.Y,
+			Curve: c,
+			X:     new(big.Int).SetBytes(eccPoint.X.Buffer),
+			Y:     new(big.Int).SetBytes(eccPoint.Y.Buffer),
 		}
 		k.keyType = TypeECC
 		k.curve = c
