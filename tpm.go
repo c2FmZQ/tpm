@@ -630,7 +630,10 @@ func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signatur
 			Scheme:  tpm2.TPMAlgRSASSA,
 			Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgRSASSA, &hashAlg),
 		}
-		if _, ok := opts.(*rsa.PSSOptions); ok {
+		if pss, ok := opts.(*rsa.PSSOptions); ok {
+			if pss.SaltLength != 32 {
+				return nil, fmt.Errorf("unexpected pss salt length %d, want 32", pss.SaltLength)
+			}
 			scheme.Scheme = tpm2.TPMAlgRSAPSS
 			scheme.Details = tpm2.NewTPMUSigScheme(tpm2.TPMAlgRSAPSS, &hashAlg)
 		}
