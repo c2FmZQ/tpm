@@ -260,7 +260,8 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 		}
 
 	case TypeECC:
-		unique := make([]byte, 64)
+		uniqueSize := opt.curve.Params().BitSize / 8
+		unique := make([]byte, 2*uniqueSize)
 		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
 			return nil, fmt.Errorf("rand: %w", err)
 		}
@@ -307,8 +308,8 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 			Unique: tpm2.NewTPMUPublicID(
 				tpm2.TPMAlgECC,
 				&tpm2.TPMSECCPoint{
-					X: tpm2.TPM2BECCParameter{Buffer: unique[:32]},
-					Y: tpm2.TPM2BECCParameter{Buffer: unique[32:]},
+					X: tpm2.TPM2BECCParameter{Buffer: unique[:uniqueSize]},
+					Y: tpm2.TPM2BECCParameter{Buffer: unique[uniqueSize:]},
 				},
 			),
 		}
@@ -432,9 +433,6 @@ func (t *TPM) unmarshalLocked(in []byte) (*Key, error) {
 		priv: *priv,
 		pub:  *pub,
 		keyb: in,
-	}
-	if t.loadedKey == out.id {
-		t.flushLocked()
 	}
 	if err := out.loadLocked(); err != nil {
 		return nil, err

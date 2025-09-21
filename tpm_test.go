@@ -139,6 +139,9 @@ func TestECC(t *testing.T) {
 		}
 
 		pub := key.Public()
+		if got, want := pub.(*ecdsa.PublicKey).Curve.Params().BitSize, curve.Params().BitSize; got != want {
+			t.Fatalf("pub.Curve.Params().BitSize = %d, want %d", got, want)
+		}
 		hashed := sha256.Sum256([]byte(payload))
 		sig, err := key.Sign(nil, hashed[:], crypto.SHA256)
 		if err != nil {
