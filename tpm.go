@@ -434,6 +434,9 @@ func (t *TPM) unmarshalLocked(in []byte) (*Key, error) {
 		pub:  *pub,
 		keyb: in,
 	}
+	if t.loadedKey == out.id {
+		t.flushLocked()
+	}
 	if err := out.loadLocked(); err != nil {
 		return nil, err
 	}
