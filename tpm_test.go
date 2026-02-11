@@ -219,55 +219,82 @@ func TestHMAC(t *testing.T) {
 	}
 	defer tpm.Close()
 
+	// Test HMAC SHA256, SHA384, SHA512
+	tests := []struct {
+		bits int
+		hash crypto.Hash
+	}{
+		{256, crypto.SHA256},
+		{384, crypto.SHA384},
+		{512, crypto.SHA512},
+	}
+
 	// Default size (SHA256)
 	key, err := tpm.CreateKey(WithHMAC(0))
 	if err != nil {
 		t.Fatalf("tpm.CreateKey: %v", err)
 	}
-
-	if got, want := key.Type(), TypeHMAC; got != want {
-		t.Fatalf("key.Type() = %d, want %d", got, want)
-	}
 	if got, want := key.Bits(), 256; got != want {
 		t.Fatalf("key.Bits() = %d, want %d", got, want)
 	}
 
-	hashed := sha256.Sum256([]byte(payload))
-	sig, err := key.Sign(nil, hashed[:], crypto.SHA256)
-	if err != nil {
-		t.Fatalf("Sign(): %v", err)
-	}
+	for _, tc := range tests {
+		key, err := tpm.CreateKey(WithHMAC(tc.bits))
+		if err != nil {
+			t.Fatalf("tpm.CreateKey(%d): %v", tc.bits, err)
+		}
 
-	// Verify by signing again
-	sig2, err := key.Sign(nil, hashed[:], crypto.SHA256)
-	if err != nil {
-		t.Fatalf("Sign() 2: %v", err)
-	}
+		if got, want := key.Type(), TypeHMAC; got != want {
+			t.Fatalf("key.Type() = %d, want %d", got, want)
+		}
+		if got, want := key.Bits(), tc.bits; got != want {
+			t.Fatalf("key.Bits() = %d, want %d", got, want)
+		}
 
-	if !bytes.Equal(sig, sig2) {
-		t.Fatal("HMAC verification failed: signatures do not match")
-	}
+		var hashed []byte
+		if tc.hash == crypto.SHA256 {
+			h := sha256.Sum256([]byte(payload))
+			hashed = h[:]
+		} else {
+			// For simplicity in test, just use empty or simple data,
+			// but we should match the hash size to be realistic if needed.
+			// Actually Sign() takes a digest, so we should provide a digest.
+			h := tc.hash.New()
+			h.Write([]byte(payload))
+			hashed = h.Sum(nil)
+		}
 
-	// Test HMAC method
-	mac, err := key.HMAC(hashed[:])
-	if err != nil {
-		t.Fatalf("key.HMAC: %v", err)
-	}
-	if !bytes.Equal(sig, mac) {
-		t.Fatal("HMAC verification failed: signatures do not match")
-	}
+		sig, err := key.Sign(nil, hashed, tc.hash)
+		if err != nil {
+			t.Fatalf("Sign(): %v", err)
+		}
 
-	// Verify encryption/decryption fails
-	if _, err := key.Encrypt([]byte(payload)); err == nil {
-		t.Fatal("Encrypt should have failed")
-	}
-	if _, err := key.Decrypt(nil, []byte(payload), nil); err == nil {
-		t.Fatal("Decrypt should have failed")
-	}
+		// HMAC is deterministic. Verify that signing the same data twice produces the same signature.
+		sig2, err := key.Sign(nil, hashed, tc.hash)
+		if err != nil {
+			t.Fatalf("Sign() 2: %v", err)
+		}
 
-	// Test invalid size
-	if _, err := tpm.CreateKey(WithHMAC(512)); err == nil {
-		t.Fatal("tpm.CreateKey(512) should have failed")
+		if !bytes.Equal(sig, sig2) {
+			t.Fatal("HMAC signatures should be deterministic, but they do not match")
+		}
+
+		// Test HMAC method
+		mac, err := key.HMAC(hashed)
+		if err != nil {
+			t.Fatalf("key.HMAC: %v", err)
+		}
+		if !bytes.Equal(sig, mac) {
+			t.Fatal("HMAC verification failed: signatures do not match")
+		}
+
+		// Verify encryption/decryption fails
+		if _, err := key.Encrypt([]byte(payload)); err == nil {
+			t.Fatal("Encrypt should have failed")
+		}
+		if _, err := key.Decrypt(nil, []byte(payload), nil); err == nil {
+			t.Fatal("Decrypt should have failed")
+		}
 	}
 }
 

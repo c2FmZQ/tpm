@@ -364,16 +364,23 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 		}
 
 	case TypeHMAC:
-		if opt.bits != 0 && opt.bits != 256 {
-			return nil, fmt.Errorf("HMAC key size %d not supported", opt.bits)
+		var hashAlg tpm2.TPMAlgID
+		switch opt.bits {
+		case 384:
+			hashAlg = tpm2.TPMAlgSHA384
+		case 512:
+			hashAlg = tpm2.TPMAlgSHA512
+		default:
+			hashAlg = tpm2.TPMAlgSHA256
 		}
+
 		unique := make([]byte, 32)
 		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
 			return nil, fmt.Errorf("rand: %w", err)
 		}
 		public = tpm2.TPMTPublic{
 			Type:    tpm2.TPMAlgKeyedHash,
-			NameAlg: tpm2.TPMAlgSHA256,
+			NameAlg: hashAlg,
 			ObjectAttributes: tpm2.TPMAObject{
 				FixedTPM:             true,
 				STClear:              false,
@@ -395,7 +402,7 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 						Details: tpm2.NewTPMUSchemeKeyedHash(
 							tpm2.TPMAlgHMAC,
 							&tpm2.TPMSSchemeHMAC{
-								HashAlg: tpm2.TPMAlgSHA256,
+								HashAlg: hashAlg,
 							},
 						),
 					},
@@ -618,9 +625,18 @@ func (k *Key) getPublicLocked() error {
 		}
 		if keyedHashParms.Scheme.Scheme == tpm2.TPMAlgHMAC {
 			k.keyType = TypeHMAC
-			// The key size is not explicitly available in the public area for HMAC keys.
-			// However, since we default to SHA256, we can assume 256 bits.
-			k.bits = 256
+			details, err := keyedHashParms.Scheme.Details.HMAC()
+			if err != nil {
+				return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			}
+			switch details.HashAlg {
+			case tpm2.TPMAlgSHA384:
+				k.bits = 384
+			case tpm2.TPMAlgSHA512:
+				k.bits = 512
+			default:
+				k.bits = 256
+			}
 		}
 	}
 	return nil
@@ -682,6 +698,32 @@ func (k *Key) HMAC(message []byte) ([]byte, error) {
 	if k.keyType != TypeHMAC {
 		return nil, ErrWrongKeyType
 	}
+	// For HMAC, the hash algorithm is fixed at creation time.
+	// We use SHA256 as a default/placeholder if we don't know it,
+	// but ideally we should use the key's hash algorithm.
+	// Since we don't store it explicitly, let's assume the key's
+	// algorithm matches what we'd expect (e.g. SHA256 for 256 bits).
+	// But wait, the HMAC command takes a HashAlg. This is the algorithm
+	// used for the HMAC calculation. It should match the key's scheme.
+	// We can try to infer it or just use SHA256 if 256 bits?
+	// Actually, the TPM2_HMAC command documentation says "HashAlg: The hash algorithm to use".
+	// It's likely this should match the key's defined scheme if it's restricted.
+	// Let's rely on k.hmacLocked to pick the right one.
+	return k.hmacLocked(message, tpm2.TPMAlgNull)
+}
+
+func (k *Key) hmacLocked(message []byte, hashAlg tpm2.TPMAlgID) ([]byte, error) {
+	if hashAlg == tpm2.TPMAlgNull {
+		switch k.bits {
+		case 384:
+			hashAlg = tpm2.TPMAlgSHA384
+		case 512:
+			hashAlg = tpm2.TPMAlgSHA512
+		default:
+			hashAlg = tpm2.TPMAlgSHA256
+		}
+	}
+
 	resp, err := tpm2.Hmac{
 		Handle: tpm2.AuthHandle{
 			Handle: k.t.loadedHandle,
@@ -693,7 +735,7 @@ func (k *Key) HMAC(message []byte) ([]byte, error) {
 		Buffer: tpm2.TPM2BMaxBuffer{
 			Buffer: message,
 		},
-		HashAlg: tpm2.TPMAlgSHA256,
+		HashAlg: hashAlg,
 	}.Execute(k.t.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("TPM2_HMAC: %w", err)
@@ -701,7 +743,10 @@ func (k *Key) HMAC(message []byte) ([]byte, error) {
 	return resp.OutHMAC.Buffer, nil
 }
 
-// Sign signs a digest with the key (RSA only).
+// Sign signs a digest with the key (RSA and ECC) or computes the HMAC
+// (HMAC keys).
+//
+// For HMAC keys, it is functionally equivalent to calling HMAC().
 func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
 	k.t.mu.Lock()
 	defer k.t.mu.Unlock()
@@ -803,23 +848,7 @@ func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signatur
 		return b.Bytes()
 
 	case TypeHMAC:
-		resp, err := tpm2.Hmac{
-			Handle: tpm2.AuthHandle{
-				Handle: k.t.loadedHandle,
-				Name: tpm2.TPM2BName{
-					Buffer: []byte(k.id),
-				},
-				Auth: tpm2.PasswordAuth(k.t.objectAuth),
-			},
-			Buffer: tpm2.TPM2BMaxBuffer{
-				Buffer: digest,
-			},
-			HashAlg: hashAlg.HashAlg,
-		}.Execute(k.t.tpm)
-		if err != nil {
-			return nil, fmt.Errorf("TPM2_HMAC: %w", err)
-		}
-		return resp.OutHMAC.Buffer, nil
+		return k.hmacLocked(digest, hashAlg.HashAlg)
 
 	default:
 		return nil, ErrWrongKeyType
