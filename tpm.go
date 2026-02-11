@@ -739,8 +739,6 @@ func (k *Key) hmacLocked(message []byte) ([]byte, error) {
 
 // Sign signs a digest with the key (RSA and ECC) or computes the HMAC
 // (HMAC keys).
-//
-// For HMAC keys, it is functionally equivalent to calling HMAC().
 func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
 	k.t.mu.Lock()
 	defer k.t.mu.Unlock()
