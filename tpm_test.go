@@ -248,6 +248,15 @@ func TestHMAC(t *testing.T) {
 		t.Fatal("HMAC verification failed: signatures do not match")
 	}
 
+	// Test HMAC method
+	mac, err := key.HMAC(hashed[:])
+	if err != nil {
+		t.Fatalf("key.HMAC: %v", err)
+	}
+	if !bytes.Equal(sig, mac) {
+		t.Fatal("HMAC verification failed: signatures do not match")
+	}
+
 	// Verify encryption/decryption fails
 	if _, err := key.Encrypt([]byte(payload)); err == nil {
 		t.Fatal("Encrypt should have failed")

@@ -672,6 +672,35 @@ func (k *Key) Curve() elliptic.Curve {
 	return k.curve
 }
 
+// HMAC returns the HMAC signature of the message.
+func (k *Key) HMAC(message []byte) ([]byte, error) {
+	k.t.mu.Lock()
+	defer k.t.mu.Unlock()
+	if err := k.loadLocked(); err != nil {
+		return nil, err
+	}
+	if k.keyType != TypeHMAC {
+		return nil, ErrWrongKeyType
+	}
+	resp, err := tpm2.Hmac{
+		Handle: tpm2.AuthHandle{
+			Handle: k.t.loadedHandle,
+			Name: tpm2.TPM2BName{
+				Buffer: []byte(k.id),
+			},
+			Auth: tpm2.PasswordAuth(k.t.objectAuth),
+		},
+		Buffer: tpm2.TPM2BMaxBuffer{
+			Buffer: message,
+		},
+		HashAlg: tpm2.TPMAlgSHA256,
+	}.Execute(k.t.tpm)
+	if err != nil {
+		return nil, fmt.Errorf("TPM2_HMAC: %w", err)
+	}
+	return resp.OutHMAC.Buffer, nil
+}
+
 // Sign signs a digest with the key (RSA only).
 func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
 	k.t.mu.Lock()
