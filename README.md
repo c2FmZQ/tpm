@@ -1,14 +1,14 @@
 # tpm
 
 This package is an abstraction on top of the go-tpm libraries to use a local
-TPM to create and use RSA, ECC, and AES keys that are bound to that TPM. The
-keys can never be used without the TPM that was used to create them.
+TPM to create and use RSA, ECC, AES, and HMAC keys that are bound to that TPM.
+The keys can never be used without the TPM that was used to create them.
 
 Any number of keys can be created and used concurrently. The library takes
 care loading the right key in the TPM, as needed.
 
-By default, 2048-bit RSA keys are created. AES keys, ECC keys, and RSA keys of
-different sizes can also be created if the TPM supports them.
+By default, 2048-bit RSA keys are created. AES keys, ECC keys, HMAC keys, and
+RSA keys of different sizes can also be created if the TPM supports them.
 
 ## Example:
 

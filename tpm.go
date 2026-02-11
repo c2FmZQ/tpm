@@ -22,14 +22,14 @@
 // SOFTWARE.
 
 // Package tpm is an abstraction on top of the go-tpm libraries to use a local
-// TPM to create and use RSA, ECC, and AES keys that are bound to that TPM. The
-// keys can never be used without the TPM that was used to create them.
+// TPM to create and use RSA, ECC, AES, and HMAC keys that are bound to that TPM.
+// The keys can never be used without the TPM that was used to create them.
 //
 // Any number of keys can be created and used concurrently. The library takes
 // care loading the right key in the TPM, as needed.
 //
-// By default, 2048-bit RSA keys are created. AES keys, ECC keys, and RSA keys
-// of different sizes can also be created if the TPM supports them.
+// By default, 2048-bit RSA keys are created. AES keys, ECC keys, HMAC keys, and
+// RSA keys of different sizes can also be created if the TPM supports them.
 package tpm
 
 import (
@@ -56,9 +56,10 @@ import (
 )
 
 const (
-	TypeRSA KeyType = 1
-	TypeECC KeyType = 2
-	TypeAES KeyType = 3
+	TypeRSA  KeyType = 1
+	TypeECC  KeyType = 2
+	TypeAES  KeyType = 3
+	TypeHMAC KeyType = 4
 )
 
 var (
@@ -77,6 +78,8 @@ func (t KeyType) String() string {
 		return "ECC"
 	case TypeAES:
 		return "AES"
+	case TypeHMAC:
+		return "HMAC"
 	default:
 		return ""
 	}
@@ -187,6 +190,15 @@ func WithECC(curve elliptic.Curve) KeyOption {
 func WithAES(bits int) KeyOption {
 	return func(opts *keyOptions) {
 		opts.keyType = TypeAES
+		opts.bits = bits
+		opts.curve = nil
+	}
+}
+
+// WithHMAC indicates that an HMAC key should be created.
+func WithHMAC(bits int) KeyOption {
+	return func(opts *keyOptions) {
+		opts.keyType = TypeHMAC
 		opts.bits = bits
 		opts.curve = nil
 	}
@@ -350,6 +362,51 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 				&tpm2.TPM2BDigest{Buffer: unique},
 			),
 		}
+
+	case TypeHMAC:
+		if opt.bits != 0 && opt.bits != 256 {
+			return nil, fmt.Errorf("HMAC key size %d not supported", opt.bits)
+		}
+		unique := make([]byte, 32)
+		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
+			return nil, fmt.Errorf("rand: %w", err)
+		}
+		public = tpm2.TPMTPublic{
+			Type:    tpm2.TPMAlgKeyedHash,
+			NameAlg: tpm2.TPMAlgSHA256,
+			ObjectAttributes: tpm2.TPMAObject{
+				FixedTPM:             true,
+				STClear:              false,
+				FixedParent:          true,
+				SensitiveDataOrigin:  true,
+				UserWithAuth:         true,
+				AdminWithPolicy:      false,
+				NoDA:                 false,
+				EncryptedDuplication: false,
+				Restricted:           false,
+				Decrypt:              false,
+				SignEncrypt:          true,
+			},
+			Parameters: tpm2.NewTPMUPublicParms(
+				tpm2.TPMAlgKeyedHash,
+				&tpm2.TPMSKeyedHashParms{
+					Scheme: tpm2.TPMTKeyedHashScheme{
+						Scheme: tpm2.TPMAlgHMAC,
+						Details: tpm2.NewTPMUSchemeKeyedHash(
+							tpm2.TPMAlgHMAC,
+							&tpm2.TPMSSchemeHMAC{
+								HashAlg: tpm2.TPMAlgSHA256,
+							},
+						),
+					},
+				},
+			),
+			Unique: tpm2.NewTPMUPublicID(
+				tpm2.TPMAlgKeyedHash,
+				&tpm2.TPM2BDigest{Buffer: unique},
+			),
+		}
+
 	default:
 		return nil, ErrWrongKeyType
 	}
@@ -553,6 +610,18 @@ func (k *Key) getPublicLocked() error {
 			k.keyType = TypeAES
 			k.bits = int(*bits)
 		}
+
+	case tpm2.TPMAlgKeyedHash:
+		keyedHashParms, err := outPublic.Parameters.KeyedHashDetail()
+		if err != nil {
+			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+		}
+		if keyedHashParms.Scheme.Scheme == tpm2.TPMAlgHMAC {
+			k.keyType = TypeHMAC
+			// The key size is not explicitly available in the public area for HMAC keys.
+			// However, since we default to SHA256, we can assume 256 bits.
+			k.bits = 256
+		}
 	}
 	return nil
 }
@@ -703,6 +772,25 @@ func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signatur
 			addASN1IntBytes(b, sig.SignatureS.Buffer)
 		})
 		return b.Bytes()
+
+	case TypeHMAC:
+		resp, err := tpm2.Hmac{
+			Handle: tpm2.AuthHandle{
+				Handle: k.t.loadedHandle,
+				Name: tpm2.TPM2BName{
+					Buffer: []byte(k.id),
+				},
+				Auth: tpm2.PasswordAuth(k.t.objectAuth),
+			},
+			Buffer: tpm2.TPM2BMaxBuffer{
+				Buffer: digest,
+			},
+			HashAlg: hashAlg.HashAlg,
+		}.Execute(k.t.tpm)
+		if err != nil {
+			return nil, fmt.Errorf("TPM2_HMAC: %w", err)
+		}
+		return resp.OutHMAC.Buffer, nil
 
 	default:
 		return nil, ErrWrongKeyType

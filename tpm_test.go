@@ -202,6 +202,66 @@ func TestAES(t *testing.T) {
 	}
 }
 
+func TestHMAC(t *testing.T) {
+	const (
+		keyPassphrase = "blah"
+		payload       = "Hello World!"
+	)
+
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+
+	tpm, err := New(WithTPM(rwc), WithObjectAuth([]byte(keyPassphrase)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	// Default size (SHA256)
+	key, err := tpm.CreateKey(WithHMAC(0))
+	if err != nil {
+		t.Fatalf("tpm.CreateKey: %v", err)
+	}
+
+	if got, want := key.Type(), TypeHMAC; got != want {
+		t.Fatalf("key.Type() = %d, want %d", got, want)
+	}
+	if got, want := key.Bits(), 256; got != want {
+		t.Fatalf("key.Bits() = %d, want %d", got, want)
+	}
+
+	hashed := sha256.Sum256([]byte(payload))
+	sig, err := key.Sign(nil, hashed[:], crypto.SHA256)
+	if err != nil {
+		t.Fatalf("Sign(): %v", err)
+	}
+
+	// Verify by signing again
+	sig2, err := key.Sign(nil, hashed[:], crypto.SHA256)
+	if err != nil {
+		t.Fatalf("Sign() 2: %v", err)
+	}
+
+	if !bytes.Equal(sig, sig2) {
+		t.Fatal("HMAC verification failed: signatures do not match")
+	}
+
+	// Verify encryption/decryption fails
+	if _, err := key.Encrypt([]byte(payload)); err == nil {
+		t.Fatal("Encrypt should have failed")
+	}
+	if _, err := key.Decrypt(nil, []byte(payload), nil); err == nil {
+		t.Fatal("Decrypt should have failed")
+	}
+
+	// Test invalid size
+	if _, err := tpm.CreateKey(WithHMAC(512)); err == nil {
+		t.Fatal("tpm.CreateKey(512) should have failed")
+	}
+}
+
 func TestMarshal(t *testing.T) {
 	const (
 		keyPassphrase = "blah"
