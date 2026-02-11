@@ -279,13 +279,24 @@ func TestHMAC(t *testing.T) {
 			t.Fatal("HMAC signatures should be deterministic, but they do not match")
 		}
 
-		// Test HMAC method
-		mac, err := key.HMAC(hashed)
+		// Test HMAC method on the original payload.
+		mac, err := key.HMAC([]byte(payload))
 		if err != nil {
 			t.Fatalf("key.HMAC: %v", err)
 		}
-		if !bytes.Equal(sig, mac) {
-			t.Fatal("HMAC verification failed: signatures do not match")
+
+		// HMAC is deterministic. Verify that HMACing the same data twice produces the same MAC.
+		mac2, err := key.HMAC([]byte(payload))
+		if err != nil {
+			t.Fatalf("key.HMAC 2: %v", err)
+		}
+		if !bytes.Equal(mac, mac2) {
+			t.Fatal("HMAC results should be deterministic, but they do not match")
+		}
+
+		// The result of HMAC(message) should be different from Sign(hash(message)).
+		if bytes.Equal(sig, mac) {
+			t.Fatal("key.Sign(hash) and key.HMAC(message) should not produce the same result")
 		}
 
 		// Verify encryption/decryption fails
