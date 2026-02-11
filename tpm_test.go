@@ -202,6 +202,118 @@ func TestAES(t *testing.T) {
 	}
 }
 
+func TestHMAC(t *testing.T) {
+	const (
+		keyPassphrase = "blah"
+		payload       = "Hello World!"
+	)
+
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+
+	tpm, err := New(WithTPM(rwc), WithObjectAuth([]byte(keyPassphrase)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	// Test HMAC SHA256, SHA384, SHA512
+	tests := []struct {
+		bits int
+		hash crypto.Hash
+	}{
+		{256, crypto.SHA256},
+		{384, crypto.SHA384},
+		{512, crypto.SHA512},
+	}
+
+	// Default size (SHA256)
+	key, err := tpm.CreateKey(WithHMAC(0))
+	if err != nil {
+		t.Fatalf("tpm.CreateKey: %v", err)
+	}
+	if got, want := key.Bits(), 256; got != want {
+		t.Fatalf("key.Bits() = %d, want %d", got, want)
+	}
+
+	for _, tc := range tests {
+		key, err := tpm.CreateKey(WithHMAC(tc.bits))
+		if err != nil {
+			t.Fatalf("tpm.CreateKey(%d): %v", tc.bits, err)
+		}
+
+		if got, want := key.Type(), TypeHMAC; got != want {
+			t.Fatalf("key.Type() = %d, want %d", got, want)
+		}
+		if got, want := key.Bits(), tc.bits; got != want {
+			t.Fatalf("key.Bits() = %d, want %d", got, want)
+		}
+
+		var hashed []byte
+		if tc.hash == crypto.SHA256 {
+			h := sha256.Sum256([]byte(payload))
+			hashed = h[:]
+		} else {
+			// For simplicity in test, just use empty or simple data,
+			// but we should match the hash size to be realistic if needed.
+			// Actually Sign() takes a digest, so we should provide a digest.
+			h := tc.hash.New()
+			h.Write([]byte(payload))
+			hashed = h.Sum(nil)
+		}
+
+		sig, err := key.Sign(nil, hashed, tc.hash)
+		if err != nil {
+			t.Fatalf("Sign(): %v", err)
+		}
+
+		// HMAC is deterministic. Verify that signing the same data twice produces the same signature.
+		sig2, err := key.Sign(nil, hashed, tc.hash)
+		if err != nil {
+			t.Fatalf("Sign() 2: %v", err)
+		}
+
+		if !bytes.Equal(sig, sig2) {
+			t.Fatal("HMAC signatures should be deterministic, but they do not match")
+		}
+
+		// Test HMAC method on the original payload.
+		mac, err := key.HMAC([]byte(payload))
+		if err != nil {
+			t.Fatalf("key.HMAC: %v", err)
+		}
+
+		// HMAC is deterministic. Verify that HMACing the same data twice produces the same MAC.
+		mac2, err := key.HMAC([]byte(payload))
+		if err != nil {
+			t.Fatalf("key.HMAC 2: %v", err)
+		}
+		if !bytes.Equal(mac, mac2) {
+			t.Fatal("HMAC results should be deterministic, but they do not match")
+		}
+
+		// The result of HMAC(message) should be different from Sign(hash(message)).
+		if bytes.Equal(sig, mac) {
+			t.Fatal("key.Sign(hash) and key.HMAC(message) should not produce the same result")
+		}
+
+		// Verify encryption/decryption fails
+		if _, err := key.Encrypt([]byte(payload)); err == nil {
+			t.Fatal("Encrypt should have failed")
+		}
+		if _, err := key.Decrypt(nil, []byte(payload), nil); err == nil {
+			t.Fatal("Decrypt should have failed")
+		}
+	}
+
+	// Test invalid size
+	if _, err := tpm.CreateKey(WithHMAC(511)); err == nil {
+		t.Fatal("tpm.CreateKey(511) should have failed")
+	}
+}
+
 func TestMarshal(t *testing.T) {
 	const (
 		keyPassphrase = "blah"
