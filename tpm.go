@@ -370,8 +370,10 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 			hashAlg = tpm2.TPMAlgSHA384
 		case 512:
 			hashAlg = tpm2.TPMAlgSHA512
-		default:
+		case 0, 256:
 			hashAlg = tpm2.TPMAlgSHA256
+		default:
+			return nil, fmt.Errorf("HMAC key size %d not supported", opt.bits)
 		}
 
 		unique := make([]byte, 32)
@@ -634,8 +636,10 @@ func (k *Key) getPublicLocked() error {
 				k.bits = 384
 			case tpm2.TPMAlgSHA512:
 				k.bits = 512
-			default:
+			case tpm2.TPMAlgSHA256:
 				k.bits = 256
+			default:
+				k.bits = -1
 			}
 		}
 	}
@@ -698,30 +702,20 @@ func (k *Key) HMAC(message []byte) ([]byte, error) {
 	if k.keyType != TypeHMAC {
 		return nil, ErrWrongKeyType
 	}
-	// For HMAC, the hash algorithm is fixed at creation time.
-	// We use SHA256 as a default/placeholder if we don't know it,
-	// but ideally we should use the key's hash algorithm.
-	// Since we don't store it explicitly, let's assume the key's
-	// algorithm matches what we'd expect (e.g. SHA256 for 256 bits).
-	// But wait, the HMAC command takes a HashAlg. This is the algorithm
-	// used for the HMAC calculation. It should match the key's scheme.
-	// We can try to infer it or just use SHA256 if 256 bits?
-	// Actually, the TPM2_HMAC command documentation says "HashAlg: The hash algorithm to use".
-	// It's likely this should match the key's defined scheme if it's restricted.
-	// Let's rely on k.hmacLocked to pick the right one.
-	return k.hmacLocked(message, tpm2.TPMAlgNull)
+	return k.hmacLocked(message)
 }
 
-func (k *Key) hmacLocked(message []byte, hashAlg tpm2.TPMAlgID) ([]byte, error) {
-	if hashAlg == tpm2.TPMAlgNull {
-		switch k.bits {
-		case 384:
-			hashAlg = tpm2.TPMAlgSHA384
-		case 512:
-			hashAlg = tpm2.TPMAlgSHA512
-		default:
-			hashAlg = tpm2.TPMAlgSHA256
-		}
+func (k *Key) hmacLocked(message []byte) ([]byte, error) {
+	var hashAlg tpm2.TPMAlgID
+	switch k.bits {
+	case 384:
+		hashAlg = tpm2.TPMAlgSHA384
+	case 512:
+		hashAlg = tpm2.TPMAlgSHA512
+	case 256:
+		hashAlg = tpm2.TPMAlgSHA256
+	default:
+		return nil, ErrWrongKeyType
 	}
 
 	resp, err := tpm2.Hmac{
@@ -848,7 +842,7 @@ func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signatur
 		return b.Bytes()
 
 	case TypeHMAC:
-		return k.hmacLocked(digest, hashAlg.HashAlg)
+		return k.hmacLocked(digest)
 
 	default:
 		return nil, ErrWrongKeyType

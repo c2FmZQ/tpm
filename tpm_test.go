@@ -296,6 +296,11 @@ func TestHMAC(t *testing.T) {
 			t.Fatal("Decrypt should have failed")
 		}
 	}
+
+	// Test invalid size
+	if _, err := tpm.CreateKey(WithHMAC(511)); err == nil {
+		t.Fatal("tpm.CreateKey(511) should have failed")
+	}
 }
 
 func TestMarshal(t *testing.T) {
