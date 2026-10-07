@@ -70,6 +70,7 @@ var (
 	ErrWrongKeyType = errors.New("operation not implemented with this key type")
 	ErrInvalidCurve = errors.New("invalid curve id")
 	ErrDecrypt      = errors.New("decryption error")
+	ErrInvalidKey   = errors.New("invalid or unsupported key")
 	ErrWrongTPM     = errors.New("key was created with a different TPM or storage root key")
 )
 
@@ -614,6 +615,13 @@ func (k *Key) loadLocked() error {
 
 // parsePublic extracts the key's parameters from its public area.
 func (k *Key) parsePublic(outPublic *tpm2.TPMTPublic) error {
+	// Only accept keys that were generated inside this TPM and that can't
+	// leave it. Anyone with access to the TPM can create or import keys
+	// under the SRK, including keys with sensitive data that they know.
+	attrs := outPublic.ObjectAttributes
+	if !attrs.FixedTPM || !attrs.FixedParent || !attrs.SensitiveDataOrigin || !attrs.UserWithAuth {
+		return ErrInvalidKey
+	}
 	switch tpm2.TPMAlgID(outPublic.Type) {
 	case tpm2.TPMAlgRSA:
 		rsaParms, err := outPublic.Parameters.RSADetail()
@@ -689,6 +697,9 @@ func (k *Key) parsePublic(outPublic *tpm2.TPMTPublic) error {
 				k.bits = -1
 			}
 		}
+	}
+	if k.keyType == 0 {
+		return ErrInvalidKey
 	}
 	return nil
 }

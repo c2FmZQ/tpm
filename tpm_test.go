@@ -40,6 +40,7 @@ import (
 	"github.com/google/go-tpm-tools/simulator"
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"golang.org/x/crypto/cryptobyte"
 )
 
 func TestRSA(t *testing.T) {
@@ -591,5 +592,76 @@ func TestBusConfidentiality(t *testing.T) {
 		if bytes.Contains(rec.buf.Bytes(), secret) {
 			t.Errorf("%q seen on the bus", secret)
 		}
+	}
+}
+
+func TestRejectKnownSensitiveKey(t *testing.T) {
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+	tpm, err := New(WithTPM(rwc))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	// Create an HMAC key under the SRK with a key value chosen by the
+	// caller, i.e. a key that isn't secret.
+	tpm.mu.Lock()
+	srk, err := tpm.srkLocked()
+	if err != nil {
+		tpm.mu.Unlock()
+		t.Fatalf("srkLocked: %v", err)
+	}
+	createResp, err := tpm2.Create{
+		ParentHandle: tpm2.AuthHandle{
+			Handle: srk.Handle,
+			Name:   srk.Name,
+			Auth:   tpm.sessionLocked(nil),
+		},
+		InSensitive: tpm2.TPM2BSensitiveCreate{
+			Sensitive: &tpm2.TPMSSensitiveCreate{
+				Data: tpm2.NewTPMUSensitiveCreate(&tpm2.TPM2BSensitiveData{
+					Buffer: []byte("attacker-known-key"),
+				}),
+			},
+		},
+		InPublic: tpm2.New2B(tpm2.TPMTPublic{
+			Type:    tpm2.TPMAlgKeyedHash,
+			NameAlg: tpm2.TPMAlgSHA256,
+			ObjectAttributes: tpm2.TPMAObject{
+				FixedTPM:     true,
+				FixedParent:  true,
+				UserWithAuth: true,
+				SignEncrypt:  true,
+			},
+			Parameters: tpm2.NewTPMUPublicParms(
+				tpm2.TPMAlgKeyedHash,
+				&tpm2.TPMSKeyedHashParms{
+					Scheme: tpm2.TPMTKeyedHashScheme{
+						Scheme: tpm2.TPMAlgHMAC,
+						Details: tpm2.NewTPMUSchemeKeyedHash(
+							tpm2.TPMAlgHMAC,
+							&tpm2.TPMSSchemeHMAC{HashAlg: tpm2.TPMAlgSHA256},
+						),
+					},
+				},
+			),
+		}),
+	}.Execute(tpm.tpm)
+	tpm.mu.Unlock()
+	if err != nil {
+		t.Fatalf("TPM2_Create: %v", err)
+	}
+
+	var b cryptobyte.Builder
+	b.AddUint8(keyFormatVersion)
+	b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) { b.AddBytes(srk.Name.Buffer) })
+	b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) { b.AddBytes(tpm2.Marshal(createResp.OutPrivate)) })
+	b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) { b.AddBytes(tpm2.Marshal(createResp.OutPublic)) })
+
+	if _, err := tpm.UnmarshalKey(b.BytesOrPanic()); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("tpm.UnmarshalKey: got %v, want %v", err, ErrInvalidKey)
 	}
 }
