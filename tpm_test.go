@@ -30,6 +30,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -121,6 +122,13 @@ func TestRSA(t *testing.T) {
 		}
 		if err := rsa.VerifyPKCS1v15(pub.(*rsa.PublicKey), crypto.SHA256, hashed[:], sig); err != nil {
 			t.Fatalf("VerifyPKCS1v15: %v", err)
+		}
+		sha1Hashed := sha1.Sum([]byte(payload))
+		if _, err := key.Sign(nil, sha1Hashed[:], crypto.SHA1); err == nil {
+			t.Fatal("Sign() with SHA-1 should have failed")
+		}
+		if _, err := key.Sign(nil, hashed[:16], crypto.SHA256); err == nil {
+			t.Fatal("Sign() with short digest should have failed")
 		}
 		pssOptions := &rsa.PSSOptions{SaltLength: 32, Hash: crypto.SHA256}
 		sig2, err := key.Sign(nil, hashed[:], pssOptions)

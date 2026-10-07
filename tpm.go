@@ -829,7 +829,7 @@ func (k *Key) hmacLocked(message []byte) ([]byte, error) {
 }
 
 // Sign signs a digest with the key (RSA and ECC) or computes the HMAC
-// (HMAC keys).
+// (HMAC keys). The digest must be a SHA-256, SHA-384, or SHA-512 hash.
 func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
 	if !k.canSign {
 		return nil, ErrKeyUsage
@@ -840,19 +840,18 @@ func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signatur
 		return nil, err
 	}
 
-	var hashAlg tpm2.TPMSSchemeHash
-	switch h := opts.HashFunc(); h {
-	case crypto.SHA1:
-		hashAlg = tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA1}
-	case crypto.SHA256:
-		hashAlg = tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA256}
-	case crypto.SHA384:
-		hashAlg = tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA384}
-	case crypto.SHA512:
-		hashAlg = tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA512}
-	default:
+	h := opts.HashFunc()
+	if h == crypto.SHA1 {
 		return nil, fmt.Errorf("unexpected hash %v", h)
 	}
+	tpmHash, err := tpmHashAlg(h)
+	if err != nil {
+		return nil, err
+	}
+	if len(digest) != h.Size() {
+		return nil, fmt.Errorf("digest length %d, want %d for %v", len(digest), h.Size(), h)
+	}
+	hashAlg := tpm2.TPMSSchemeHash{HashAlg: tpmHash}
 
 	switch k.keyType {
 	case TypeRSA:
