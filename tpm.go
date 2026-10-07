@@ -95,7 +95,8 @@ func (t KeyType) String() string {
 // Option is an option that can be passed to New.
 type Option func(*TPM)
 
-// WithTPM specifies an already open TPM device to use.
+// WithTPM specifies an already open TPM device to use. The TPM may be shared
+// with other users, so New leaves existing objects alone.
 func WithTPM(rwc io.ReadWriteCloser) Option {
 	return func(t *TPM) {
 		t.tpm = transport.FromReadWriteCloser(rwc)
@@ -119,6 +120,9 @@ func WithObjectAuth(pp []byte) Option {
 }
 
 // New returns a new TPM that's ready to use.
+//
+// Without [WithTPM], New opens /dev/tpmrm0, or /dev/tpm0 if the kernel
+// resource manager isn't available.
 func New(opts ...Option) (*TPM, error) {
 	var tpm TPM
 	for _, o := range opts {
@@ -127,31 +131,43 @@ func New(opts ...Option) (*TPM, error) {
 	if tpm.tpm == nil {
 		t, err := linuxtpm.Open("/dev/tpmrm0")
 		if errors.Is(err, os.ErrNotExist) {
-			t, err = linuxtpm.Open("/dev/tpm0")
+			if t, err = linuxtpm.Open("/dev/tpm0"); err != nil {
+				return nil, err
+			}
+			// Without the resource manager, transient objects
+			// left behind by a previous process stay loaded.
+			// /dev/tpm0 can only be opened by one process at a
+			// time, so they can't belong to anyone else.
+			if err := flushTransientHandles(t); err != nil {
+				t.Close()
+				return nil, err
+			}
 		}
 		if err != nil {
 			return nil, err
 		}
 		tpm.tpm = t
 	}
+	return &tpm, nil
+}
 
-	// Flush any existing transient handles.
+func flushTransientHandles(t transport.TPM) error {
 	capResp, err := tpm2.GetCapability{
 		Capability:    tpm2.TPMCapHandles,
 		Property:      uint32(tpm2.TPMHTTransient) << 24,
 		PropertyCount: 100,
-	}.Execute(tpm.tpm)
+	}.Execute(t)
 	if err != nil {
-		return nil, fmt.Errorf("TPM2_GetCapability: %w", err)
+		return fmt.Errorf("TPM2_GetCapability: %w", err)
 	}
 	handles, err := capResp.CapabilityData.Data.Handles()
 	if err != nil {
-		return nil, fmt.Errorf("TPM2_GetCapability(Handles): %w", err)
+		return fmt.Errorf("TPM2_GetCapability(Handles): %w", err)
 	}
 	for _, h := range handles.Handle {
-		tpm2.FlushContext{FlushHandle: h}.Execute(tpm.tpm)
+		tpm2.FlushContext{FlushHandle: h}.Execute(t)
 	}
-	return &tpm, nil
+	return nil
 }
 
 var _ io.Closer = (*TPM)(nil)

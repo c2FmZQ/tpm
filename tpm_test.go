@@ -785,3 +785,27 @@ func TestKeyUsage(t *testing.T) {
 		}
 	})
 }
+
+func TestNewKeepsOtherObjects(t *testing.T) {
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+	other, err := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.TPMRHOwner,
+		InPublic:      tpm2.New2B(tpm2.ECCSRKTemplate),
+	}.Execute(transport.FromReadWriteCloser(rwc))
+	if err != nil {
+		t.Fatalf("TPM2_CreatePrimary: %v", err)
+	}
+
+	tpm, err := New(WithTPM(rwc))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	if _, err := (tpm2.ReadPublic{ObjectHandle: other.ObjectHandle}).Execute(tpm.tpm); err != nil {
+		t.Fatalf("Object created before New is gone: %v", err)
+	}
+}
