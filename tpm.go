@@ -30,12 +30,29 @@
 //
 // By default, 2048-bit RSA keys are created. AES keys, ECC keys, HMAC keys, and
 // RSA keys of different sizes can also be created if the TPM supports them.
+//
+// Keys are created under a storage root key (SRK) in the owner hierarchy, so
+// clearing the TPM invalidates them. All commands that use keys are protected
+// by HMAC sessions salted with the SRK: auth values are never sent to the TPM
+// in cleartext, secret parameters are encrypted, and responses are
+// authenticated. Serialized keys are bound to the SRK that they were created
+// under.
+//
+// The SRK itself is trusted on first use: this package doesn't verify that it
+// belongs to a genuine TPM (e.g. with the endorsement key's certificate). A
+// device that impersonates the TPM when a key is created can capture that
+// key's auth value and parameters. Once a key exists, a different device can't
+// use it, or complete the sessions that protect it.
 package tpm
 
 import (
+	"bytes"
 	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -66,6 +83,9 @@ var (
 	ErrWrongKeyType = errors.New("operation not implemented with this key type")
 	ErrInvalidCurve = errors.New("invalid curve id")
 	ErrDecrypt      = errors.New("decryption error")
+	ErrInvalidKey   = errors.New("invalid or unsupported key")
+	ErrKeyUsage     = errors.New("operation not permitted by the key's usage")
+	ErrWrongTPM     = errors.New("key was created with a different TPM or storage root key")
 )
 
 type KeyType int
@@ -88,17 +108,20 @@ func (t KeyType) String() string {
 // Option is an option that can be passed to New.
 type Option func(*TPM)
 
-// WithTPM specifies an already open TPM device to use.
+// WithTPM specifies an already open TPM device to use. The TPM may be shared
+// with other users, so New leaves existing objects alone.
 func WithTPM(rwc io.ReadWriteCloser) Option {
 	return func(t *TPM) {
 		t.tpm = transport.FromReadWriteCloser(rwc)
 	}
 }
 
-// WithEndorsementAuth specifies the endorsement passphrase.
-func WithEndorsementAuth(pp []byte) Option {
+// WithOwnerAuth specifies the owner (storage hierarchy) passphrase. Keys are
+// created under a primary key in the owner hierarchy, so clearing the TPM
+// (TPM2_Clear) invalidates them.
+func WithOwnerAuth(pp []byte) Option {
 	return func(t *TPM) {
-		t.endorsementAuth = slices.Clone(pp)
+		t.ownerAuth = slices.Clone(pp)
 	}
 }
 
@@ -110,6 +133,9 @@ func WithObjectAuth(pp []byte) Option {
 }
 
 // New returns a new TPM that's ready to use.
+//
+// Without [WithTPM], New opens /dev/tpmrm0, or /dev/tpm0 if the kernel
+// resource manager isn't available.
 func New(opts ...Option) (*TPM, error) {
 	var tpm TPM
 	for _, o := range opts {
@@ -118,31 +144,50 @@ func New(opts ...Option) (*TPM, error) {
 	if tpm.tpm == nil {
 		t, err := linuxtpm.Open("/dev/tpmrm0")
 		if errors.Is(err, os.ErrNotExist) {
-			t, err = linuxtpm.Open("/dev/tpm0")
+			if t, err = linuxtpm.Open("/dev/tpm0"); err != nil {
+				return nil, err
+			}
+			// Without the resource manager, transient objects
+			// and sessions left behind by a previous process
+			// stay loaded. /dev/tpm0 can only be opened by one
+			// process at a time, so they can't belong to anyone
+			// else.
+			if err := flushLeftoverHandles(t); err != nil {
+				t.Close()
+				return nil, err
+			}
 		}
 		if err != nil {
 			return nil, err
 		}
 		tpm.tpm = t
 	}
-
-	// Flush any existing transient handles.
-	capResp, err := tpm2.GetCapability{
-		Capability:    tpm2.TPMCapHandles,
-		Property:      uint32(tpm2.TPMHTTransient) << 24,
-		PropertyCount: 100,
-	}.Execute(tpm.tpm)
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_GetCapability: %w", err)
-	}
-	handles, err := capResp.CapabilityData.Data.Handles()
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_GetCapability(Handles): %w", err)
-	}
-	for _, h := range handles.Handle {
-		tpm2.FlushContext{FlushHandle: h}.Execute(tpm.tpm)
-	}
 	return &tpm, nil
+}
+
+func flushLeftoverHandles(t transport.TPM) error {
+	for _, ht := range []tpm2.TPMHT{
+		tpm2.TPMHTTransient,
+		tpm2.TPMHTHMACSession,   // loaded sessions
+		tpm2.TPMHTPolicySession, // saved sessions
+	} {
+		capResp, err := tpm2.GetCapability{
+			Capability:    tpm2.TPMCapHandles,
+			Property:      uint32(ht) << 24,
+			PropertyCount: 100,
+		}.Execute(t)
+		if err != nil {
+			return fmt.Errorf("TPM2_GetCapability: %w", err)
+		}
+		handles, err := capResp.CapabilityData.Data.Handles()
+		if err != nil {
+			return fmt.Errorf("TPM2_GetCapability(Handles): %w", err)
+		}
+		for _, h := range handles.Handle {
+			tpm2.FlushContext{FlushHandle: h}.Execute(t)
+		}
+	}
+	return nil
 }
 
 var _ io.Closer = (*TPM)(nil)
@@ -151,19 +196,39 @@ var _ io.Closer = (*TPM)(nil)
 // cryptographic keys that are bound to that TPM. The keys can never be used
 // without the TPM created them.
 type TPM struct {
-	mu              sync.Mutex
-	tpm             transport.TPMCloser
-	objectAuth      []byte
-	endorsementAuth []byte
-	loadedKey       string
-	loadedHandle    tpm2.TPMHandle
+	mu           sync.Mutex
+	tpm          transport.TPMCloser
+	objectAuth   []byte
+	ownerAuth    []byte
+	loadedKey    string
+	loadedHandle tpm2.TPMHandle
+	srk          tpm2.NamedHandle
+	srkPublic    tpm2.TPMTPublic
+	// Reusable sessions that authorize the use of keys, with parameter
+	// encryption in both directions, or only for the command.
+	inOutSession session
+	inSession    session
+}
+
+type session struct {
+	s     tpm2.Session
+	close func() error
 }
 
 type keyOptions struct {
 	keyType KeyType
 	bits    int
 	curve   elliptic.Curve
+	usage   keyUsage
 }
+
+type keyUsage int
+
+const (
+	usageAny keyUsage = iota
+	usageSign
+	usageDecrypt
+)
 
 // KeyOption is an option that can be passed to CreateKey.
 type KeyOption func(*keyOptions)
@@ -183,6 +248,29 @@ func WithECC(curve elliptic.Curve) KeyOption {
 		opts.keyType = TypeECC
 		opts.bits = 0
 		opts.curve = curve
+	}
+}
+
+// WithSigningOnly restricts a new RSA key to signing. The key can't be used to
+// decrypt. ECC keys are always signing-only.
+//
+// By default, RSA keys can be used for both signing and decryption. The TPM
+// requires such dual-use keys to have no fixed scheme, so they can also be
+// used with other schemes than the ones that this package uses (e.g. raw RSA
+// decryption), by anyone who can use the key directly with the TPM.
+func WithSigningOnly() KeyOption {
+	return func(opts *keyOptions) {
+		opts.usage = usageSign
+	}
+}
+
+// WithDecryptionOnly restricts a new RSA key to RSA-OAEP decryption with
+// SHA-256. The key can't be used to sign.
+//
+// See [WithSigningOnly].
+func WithDecryptionOnly() KeyOption {
+	return func(opts *keyOptions) {
+		opts.usage = usageDecrypt
 	}
 }
 
@@ -210,11 +298,16 @@ func WithHMAC(bits int) KeyOption {
 func (t *TPM) CreateKey(opts ...KeyOption) (*Key, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	b, err := t.createLocked(opts...)
-	if err != nil {
-		return nil, err
-	}
-	return t.unmarshalLocked(b)
+	var key *Key
+	err := t.runLocked(func() error {
+		b, err := t.createLocked(opts...)
+		if err != nil {
+			return err
+		}
+		key, err = t.unmarshalLocked(b)
+		return err
+	})
+	return key, err
 }
 
 func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
@@ -225,18 +318,38 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 	for _, o := range opts {
 		o(&opt)
 	}
+	if opt.keyType == TypeECC && opt.usage == usageAny {
+		// This package doesn't implement decryption with ECC keys.
+		opt.usage = usageSign
+	}
+	switch {
+	case opt.usage == usageAny:
+	case opt.keyType == TypeRSA:
+	case opt.keyType == TypeECC && opt.usage == usageSign:
+	default:
+		return nil, fmt.Errorf("key usage not supported with %s keys", opt.keyType)
+	}
 	t.flushLocked()
 
-	srk, flush, err := t.srk()
+	srk, err := t.srkLocked()
 	if err != nil {
 		return nil, err
 	}
-	defer flush()
 
 	var public tpm2.TPMTPublic
 
 	switch opt.keyType {
 	case TypeRSA:
+		rsaScheme := tpm2.TPMTRSAScheme{Scheme: tpm2.TPMAlgNull}
+		if opt.usage == usageDecrypt {
+			rsaScheme = tpm2.TPMTRSAScheme{
+				Scheme: tpm2.TPMAlgOAEP,
+				Details: tpm2.NewTPMUAsymScheme(
+					tpm2.TPMAlgOAEP,
+					&tpm2.TPMSEncSchemeOAEP{HashAlg: tpm2.TPMAlgSHA256},
+				),
+			}
+		}
 		unique := make([]byte, opt.bits/8)
 		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
 			return nil, fmt.Errorf("rand: %w", err)
@@ -254,12 +367,13 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 				NoDA:                 false,
 				EncryptedDuplication: false,
 				Restricted:           false,
-				Decrypt:              true,
-				SignEncrypt:          true,
+				Decrypt:              opt.usage != usageSign,
+				SignEncrypt:          opt.usage != usageDecrypt,
 			},
 			Parameters: tpm2.NewTPMUPublicParms(
 				tpm2.TPMAlgRSA,
 				&tpm2.TPMSRSAParms{
+					Scheme:  rsaScheme,
 					KeyBits: tpm2.TPMKeyBits(opt.bits),
 				},
 			),
@@ -272,11 +386,6 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 		}
 
 	case TypeECC:
-		uniqueSize := opt.curve.Params().BitSize / 8
-		unique := make([]byte, 2*uniqueSize)
-		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
-			return nil, fmt.Errorf("rand: %w", err)
-		}
 		var curve tpm2.TPMECCCurve
 		var hash tpm2.TPMAlgID
 		switch opt.curve {
@@ -295,6 +404,11 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 		default:
 			return nil, ErrInvalidCurve
 		}
+		uniqueSize := opt.curve.Params().BitSize / 8
+		unique := make([]byte, 2*uniqueSize)
+		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
+			return nil, fmt.Errorf("rand: %w", err)
+		}
 		public = tpm2.TPMTPublic{
 			Type:    tpm2.TPMAlgECC,
 			NameAlg: hash,
@@ -308,7 +422,7 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 				NoDA:                 false,
 				EncryptedDuplication: false,
 				Restricted:           false,
-				Decrypt:              true,
+				Decrypt:              false,
 				SignEncrypt:          true,
 			},
 			Parameters: tpm2.NewTPMUPublicParms(
@@ -421,7 +535,11 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 	}
 
 	createResp, err := tpm2.Create{
-		ParentHandle: srk,
+		ParentHandle: tpm2.AuthHandle{
+			Handle: srk.Handle,
+			Name:   srk.Name,
+			Auth:   t.sessionLocked(nil, tpm2.AESEncryption(128, tpm2.EncryptIn)),
+		},
 		InSensitive: tpm2.TPM2BSensitiveCreate{
 			Sensitive: &tpm2.TPMSSensitiveCreate{
 				UserAuth: tpm2.TPM2BAuth{
@@ -432,27 +550,104 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 		InPublic: tpm2.New2B(public),
 	}.Execute(t.tpm)
 	if err != nil {
-		return nil, fmt.Errorf("TPM2_Create: %w", err)
+		return nil, tpmError("TPM2_Create", err)
 	}
 
 	priv := tpm2.Marshal(createResp.OutPrivate)
 	pub := tpm2.Marshal(createResp.OutPublic)
 
 	buf := cryptobyte.NewBuilder(nil)
-	buf.AddUint16(uint16(len(priv)))
-	buf.AddBytes(priv)
-	buf.AddUint16(uint16(len(pub)))
-	buf.AddBytes(pub)
-
+	buf.AddUint8(keyFormatVersion)
+	buf.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+		b.AddBytes(srk.Name.Buffer)
+	})
+	buf.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+		b.AddBytes(priv)
+	})
+	buf.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+		b.AddBytes(pub)
+	})
 	return buf.Bytes()
 }
+
+// Serialized key format:
+//
+//	version (1) || uint16-prefixed SRK name || uint16-prefixed TPM2B_PRIVATE ||
+//	uint16-prefixed TPM2B_PUBLIC
+//
+// The SRK name pins the key to the storage root key that it was created
+// under. When the key is loaded, the TPM's SRK must have the same name, and
+// the commands that use the key are protected by sessions salted with that
+// SRK. A different device pretending to be the TPM cannot complete these
+// sessions.
+const keyFormatVersion = 1
 
 // Close closes the connections to the TPM.
 func (t *TPM) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.flushLocked()
+	t.resetLocked()
 	return t.tpm.Close()
+}
+
+// resetLocked flushes the loaded key, the sessions, and the SRK. They are
+// recreated when needed.
+func (t *TPM) resetLocked() {
+	t.flushLocked()
+	for _, s := range []*session{&t.inOutSession, &t.inSession} {
+		if s.s != nil {
+			s.close()
+			*s = session{}
+		}
+	}
+	if t.srk.Handle != 0 {
+		tpm2.FlushContext{FlushHandle: t.srk.Handle}.Execute(t.tpm)
+		t.srk = tpm2.NamedHandle{}
+	}
+}
+
+// runLocked runs f, which sends commands to the TPM. The SRK, the sessions,
+// and the loaded key are kept across calls. If the TPM no longer has them,
+// e.g. after a TPM restart, or because another user of a shared TPM flushed
+// them, they are recreated and f is retried once.
+func (t *TPM) runLocked(f func() error) error {
+	err := f()
+	var cmdErr *commandError
+	if !errors.As(err, &cmdErr) {
+		return err
+	}
+	var rc tpm2.TPMRC
+	if !errors.As(cmdErr.err, &rc) {
+		// The command or the response was lost, or the response
+		// didn't validate. The sessions may be out of sync with the
+		// TPM.
+		t.resetLocked()
+		return err
+	}
+	if !errors.Is(rc, tpm2.TPMRCHandle) &&
+		(rc < tpm2.TPMRCReferenceH0 || rc > tpm2.TPMRCReferenceS6) {
+		return err
+	}
+	t.resetLocked()
+	return f()
+}
+
+// commandError is an error returned by a TPM command.
+type commandError struct {
+	cmd string
+	err error
+}
+
+func tpmError(cmd string, err error) error {
+	return &commandError{cmd: cmd, err: err}
+}
+
+func (e *commandError) Error() string {
+	return e.cmd + ": " + e.err.Error()
+}
+
+func (e *commandError) Unwrap() error {
+	return e.err
 }
 
 func (t *TPM) flushLocked() {
@@ -467,7 +662,13 @@ func (t *TPM) flushLocked() {
 func (t *TPM) UnmarshalKey(b []byte) (*Key, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.unmarshalLocked(b)
+	var key *Key
+	err := t.runLocked(func() error {
+		var err error
+		key, err = t.unmarshalLocked(b)
+		return err
+	})
+	return key, err
 }
 
 func (t *TPM) unmarshalLocked(in []byte) (*Key, error) {
@@ -475,13 +676,13 @@ func (t *TPM) unmarshalLocked(in []byte) (*Key, error) {
 	hashed := sha256.Sum256(in)
 
 	str := cryptobyte.String(in)
-	var sz uint16
-	var savedPriv []byte
-	if !str.ReadUint16(&sz) || !str.ReadBytes(&savedPriv, int(sz)) {
-		return nil, errors.New("parse error")
-	}
-	var savedPub []byte
-	if !str.ReadUint16(&sz) || !str.ReadBytes(&savedPub, int(sz)) {
+	var version uint8
+	var srkName, savedPriv, savedPub cryptobyte.String
+	if !str.ReadUint8(&version) || version != keyFormatVersion ||
+		!str.ReadUint16LengthPrefixed(&srkName) ||
+		!str.ReadUint16LengthPrefixed(&savedPriv) ||
+		!str.ReadUint16LengthPrefixed(&savedPub) ||
+		!str.Empty() {
 		return nil, errors.New("parse error")
 	}
 	priv, err := tpm2.Unmarshal[tpm2.TPM2BPrivate](savedPriv)
@@ -492,16 +693,33 @@ func (t *TPM) unmarshalLocked(in []byte) (*Key, error) {
 	if err != nil {
 		return nil, fmt.Errorf("TPM2_Unmarshal: %w", err)
 	}
+	pubContents, err := pub.Contents()
+	if err != nil {
+		return nil, fmt.Errorf("TPM2_Unmarshal: %w", err)
+	}
+	name, err := tpm2.ObjectName(pubContents)
+	if err != nil {
+		return nil, fmt.Errorf("TPM2_Unmarshal: %w", err)
+	}
+
+	srk, err := t.srkLocked()
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(srk.Name.Buffer, srkName) {
+		return nil, ErrWrongTPM
+	}
 
 	out := &Key{
 		t:    t,
 		id:   hex.EncodeToString(hashed[:]),
+		name: *name,
 		priv: *priv,
 		pub:  *pub,
 		keyb: in,
 	}
-	if t.loadedKey == out.id {
-		t.flushLocked()
+	if err := out.parsePublic(pubContents); err != nil {
+		return nil, err
 	}
 	if err := out.loadLocked(); err != nil {
 		return nil, err
@@ -515,15 +733,18 @@ var _ crypto.Signer = (*Key)(nil)
 // Key performs cryptographic operations via the TPM. It implements the
 // [crypto.Signer] and [crypto.Decrypter] interfaces.
 type Key struct {
-	t         *TPM
-	id        string
-	priv      tpm2.TPM2BPrivate
-	pub       tpm2.TPM2BPublic
-	keyb      []byte
-	keyType   KeyType
-	bits      int
-	curve     elliptic.Curve
-	publicKey crypto.PublicKey
+	t          *TPM
+	id         string
+	name       tpm2.TPM2BName
+	priv       tpm2.TPM2BPrivate
+	pub        tpm2.TPM2BPublic
+	keyb       []byte
+	keyType    KeyType
+	bits       int
+	curve      elliptic.Curve
+	publicKey  crypto.PublicKey
+	canSign    bool
+	canDecrypt bool
 }
 
 func (k *Key) loadLocked() error {
@@ -532,54 +753,62 @@ func (k *Key) loadLocked() error {
 	}
 	k.t.flushLocked()
 
-	srk, flush, err := k.t.srk()
+	srk, err := k.t.srkLocked()
 	if err != nil {
 		return err
 	}
-	defer flush()
 
 	loadResp, err := tpm2.Load{
-		ParentHandle: srk,
-		InPrivate:    k.priv,
-		InPublic:     k.pub,
+		ParentHandle: tpm2.AuthHandle{
+			Handle: srk.Handle,
+			Name:   srk.Name,
+			// The SRK's auth value is empty, its private area is
+			// encrypted by the SRK, and the name of the loaded
+			// object is verified below. The commands that use the
+			// object are authorized with sessions salted with the
+			// SRK, which also cover the object's name.
+			Auth: tpm2.PasswordAuth(nil),
+		},
+		InPrivate: k.priv,
+		InPublic:  k.pub,
 	}.Execute(k.t.tpm)
 	if err != nil {
-		return fmt.Errorf("TPM2_Load: %w", err)
+		return tpmError("TPM2_Load", err)
+	}
+	if !bytes.Equal(loadResp.Name.Buffer, k.name.Buffer) {
+		tpm2.FlushContext{FlushHandle: loadResp.ObjectHandle}.Execute(k.t.tpm)
+		return errors.New("TPM2_Load: unexpected object name")
 	}
 
 	k.t.loadedKey = k.id
 	k.t.loadedHandle = loadResp.ObjectHandle
-	if k.publicKey == nil {
-		if err := k.getPublicLocked(); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
-func (k *Key) getPublicLocked() error {
-	readPublicResp, err := tpm2.ReadPublic{ObjectHandle: k.t.loadedHandle}.Execute(k.t.tpm)
-	if err != nil {
-		return fmt.Errorf("TPM2_ReadPublic: %w", err)
+// parsePublic extracts the key's parameters from its public area.
+func (k *Key) parsePublic(outPublic *tpm2.TPMTPublic) error {
+	// Only accept keys that were generated inside this TPM and that can't
+	// leave it. Anyone with access to the TPM can create or import keys
+	// under the SRK, including keys with sensitive data that they know.
+	attrs := outPublic.ObjectAttributes
+	if !attrs.FixedTPM || !attrs.FixedParent || !attrs.SensitiveDataOrigin || !attrs.UserWithAuth {
+		return ErrInvalidKey
 	}
-	outPublic, err := readPublicResp.OutPublic.Contents()
-	if err != nil {
-		return fmt.Errorf("TPM2_ReadPublic: %w", err)
-	}
-
+	k.canSign = attrs.SignEncrypt
+	k.canDecrypt = attrs.Decrypt
 	switch tpm2.TPMAlgID(outPublic.Type) {
 	case tpm2.TPMAlgRSA:
 		rsaParms, err := outPublic.Parameters.RSADetail()
 		if err != nil {
-			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			return fmt.Errorf("parsePublic: %w", err)
 		}
 		rsaPubKeyN, err := outPublic.Unique.RSA()
 		if err != nil {
-			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			return fmt.Errorf("parsePublic: %w", err)
 		}
 		rsaPubKey, err := tpm2.RSAPub(rsaParms, rsaPubKeyN)
 		if err != nil {
-			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			return fmt.Errorf("parsePublic: %w", err)
 		}
 		k.publicKey = rsaPubKey
 		k.keyType = TypeRSA
@@ -588,15 +817,15 @@ func (k *Key) getPublicLocked() error {
 	case tpm2.TPMAlgECC:
 		eccParms, err := outPublic.Parameters.ECCDetail()
 		if err != nil {
-			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			return fmt.Errorf("parsePublic: %w", err)
 		}
 		c, err := tpm2.TPMECCCurve(eccParms.CurveID).Curve()
 		if err != nil {
-			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			return fmt.Errorf("parsePublic: %w", err)
 		}
 		eccPoint, err := outPublic.Unique.ECC()
 		if err != nil {
-			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			return fmt.Errorf("parsePublic: %w", err)
 		}
 		k.publicKey = &ecdsa.PublicKey{
 			Curve: c,
@@ -609,12 +838,12 @@ func (k *Key) getPublicLocked() error {
 	case tpm2.TPMAlgSymCipher:
 		symParms, err := outPublic.Parameters.SymDetail()
 		if err != nil {
-			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			return fmt.Errorf("parsePublic: %w", err)
 		}
 		if symParms.Sym.Algorithm == tpm2.TPMAlgAES {
 			bits, err := symParms.Sym.KeyBits.AES()
 			if err != nil {
-				return fmt.Errorf("TPM2_ReadPublic: %w", err)
+				return fmt.Errorf("parsePublic: %w", err)
 			}
 			k.keyType = TypeAES
 			k.bits = int(*bits)
@@ -623,13 +852,13 @@ func (k *Key) getPublicLocked() error {
 	case tpm2.TPMAlgKeyedHash:
 		keyedHashParms, err := outPublic.Parameters.KeyedHashDetail()
 		if err != nil {
-			return fmt.Errorf("TPM2_ReadPublic: %w", err)
+			return fmt.Errorf("parsePublic: %w", err)
 		}
 		if keyedHashParms.Scheme.Scheme == tpm2.TPMAlgHMAC {
 			k.keyType = TypeHMAC
 			details, err := keyedHashParms.Scheme.Details.HMAC()
 			if err != nil {
-				return fmt.Errorf("TPM2_ReadPublic: %w", err)
+				return fmt.Errorf("parsePublic: %w", err)
 			}
 			switch details.HashAlg {
 			case tpm2.TPMAlgSHA384:
@@ -643,66 +872,62 @@ func (k *Key) getPublicLocked() error {
 			}
 		}
 	}
+	if k.keyType == 0 {
+		return ErrInvalidKey
+	}
 	return nil
 }
 
 // Marshal returns the serialized version of the key, which can be stored
 // offline, and later unmarshaled with [TPM.UnmarshalKey].
 func (k *Key) Marshal() ([]byte, error) {
-	return k.keyb, nil
+	return slices.Clone(k.keyb), nil
 }
 
 // Public returns the public key.
 func (k *Key) Public() crypto.PublicKey {
-	k.t.mu.Lock()
-	defer k.t.mu.Unlock()
-	if err := k.loadLocked(); err != nil {
-		return nil
-	}
 	return k.publicKey
 }
 
 // Type returns the key type.
 func (k *Key) Type() KeyType {
-	k.t.mu.Lock()
-	defer k.t.mu.Unlock()
-	if err := k.loadLocked(); err != nil {
-		return 0
-	}
 	return k.keyType
 }
 
 // Bits returns the key size.
 func (k *Key) Bits() int {
-	k.t.mu.Lock()
-	defer k.t.mu.Unlock()
-	if err := k.loadLocked(); err != nil {
-		return 0
-	}
 	return k.bits
 }
 
 // Curve returns the key curve ID.
 func (k *Key) Curve() elliptic.Curve {
-	k.t.mu.Lock()
-	defer k.t.mu.Unlock()
-	if err := k.loadLocked(); err != nil {
-		return nil
-	}
 	return k.curve
 }
 
 // HMAC returns the HMAC signature of the message.
 func (k *Key) HMAC(message []byte) ([]byte, error) {
-	k.t.mu.Lock()
-	defer k.t.mu.Unlock()
-	if err := k.loadLocked(); err != nil {
-		return nil, err
-	}
 	if k.keyType != TypeHMAC {
 		return nil, ErrWrongKeyType
 	}
-	return k.hmacLocked(message)
+	return k.run(func() ([]byte, error) {
+		return k.hmacLocked(message)
+	})
+}
+
+// run loads the key and runs f, which uses it.
+func (k *Key) run(f func() ([]byte, error)) ([]byte, error) {
+	k.t.mu.Lock()
+	defer k.t.mu.Unlock()
+	var out []byte
+	err := k.t.runLocked(func() error {
+		if err := k.loadLocked(); err != nil {
+			return err
+		}
+		var err error
+		out, err = f()
+		return err
+	})
+	return out, err
 }
 
 func (k *Key) hmacLocked(message []byte) ([]byte, error) {
@@ -718,13 +943,15 @@ func (k *Key) hmacLocked(message []byte) ([]byte, error) {
 		return nil, ErrWrongKeyType
 	}
 
+	sess, err := k.t.keySessionLocked(true)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := tpm2.Hmac{
 		Handle: tpm2.AuthHandle{
 			Handle: k.t.loadedHandle,
-			Name: tpm2.TPM2BName{
-				Buffer: []byte(k.id),
-			},
-			Auth: tpm2.PasswordAuth(k.t.objectAuth),
+			Name:   k.name,
+			Auth:   sess,
 		},
 		Buffer: tpm2.TPM2BMaxBuffer{
 			Buffer: message,
@@ -732,102 +959,118 @@ func (k *Key) hmacLocked(message []byte) ([]byte, error) {
 		HashAlg: hashAlg,
 	}.Execute(k.t.tpm)
 	if err != nil {
-		return nil, fmt.Errorf("TPM2_HMAC: %w", err)
+		return nil, tpmError("TPM2_HMAC", err)
 	}
 	return resp.OutHMAC.Buffer, nil
 }
 
 // Sign signs a digest with the key (RSA and ECC) or computes the HMAC
-// (HMAC keys).
+// (HMAC keys). The digest must be a SHA-256, SHA-384, or SHA-512 hash.
 func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
-	k.t.mu.Lock()
-	defer k.t.mu.Unlock()
-	if err := k.loadLocked(); err != nil {
-		return nil, err
+	if !k.canSign {
+		return nil, ErrKeyUsage
 	}
-
-	var hashAlg tpm2.TPMSSchemeHash
-	switch h := opts.HashFunc(); h {
-	case crypto.SHA1:
-		hashAlg = tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA1}
-	case crypto.SHA256:
-		hashAlg = tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA256}
-	case crypto.SHA384:
-		hashAlg = tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA384}
-	case crypto.SHA512:
-		hashAlg = tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA512}
-	default:
+	h := opts.HashFunc()
+	if h == crypto.SHA1 {
 		return nil, fmt.Errorf("unexpected hash %v", h)
 	}
+	tpmHash, err := tpmHashAlg(h)
+	if err != nil {
+		return nil, err
+	}
+	if len(digest) != h.Size() {
+		return nil, fmt.Errorf("digest length %d, want %d for %v", len(digest), h.Size(), h)
+	}
+	hashAlg := tpm2.TPMSSchemeHash{HashAlg: tpmHash}
 
+	var scheme tpm2.TPMTSigScheme
 	switch k.keyType {
 	case TypeRSA:
-		scheme := tpm2.TPMTSigScheme{
+		scheme = tpm2.TPMTSigScheme{
 			Scheme:  tpm2.TPMAlgRSASSA,
 			Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgRSASSA, &hashAlg),
 		}
 		if pss, ok := opts.(*rsa.PSSOptions); ok {
-			if pss.SaltLength != 32 {
-				return nil, fmt.Errorf("unexpected pss salt length %d, want 32", pss.SaltLength)
+			// The TPM's salt is as long as the digest.
+			switch pss.SaltLength {
+			case rsa.PSSSaltLengthAuto, rsa.PSSSaltLengthEqualsHash, h.Size():
+			default:
+				return nil, fmt.Errorf("unexpected pss salt length %d, want %d", pss.SaltLength, h.Size())
 			}
-			scheme.Scheme = tpm2.TPMAlgRSAPSS
-			scheme.Details = tpm2.NewTPMUSigScheme(tpm2.TPMAlgRSAPSS, &hashAlg)
+			scheme = tpm2.TPMTSigScheme{
+				Scheme:  tpm2.TPMAlgRSAPSS,
+				Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgRSAPSS, &hashAlg),
+			}
 		}
-		resp, err := tpm2.Sign{
-			KeyHandle: tpm2.AuthHandle{
-				Handle: k.t.loadedHandle,
-				Name: tpm2.TPM2BName{
-					Buffer: []byte(k.id),
-				},
-				Auth: tpm2.PasswordAuth(k.t.objectAuth),
-			},
-			Digest: tpm2.TPM2BDigest{
-				Buffer: digest,
-			},
-			InScheme: scheme,
-			Validation: tpm2.TPMTTKHashCheck{
-				Tag: tpm2.TPMSTHashCheck,
-			},
-		}.Execute(k.t.tpm)
+
+	case TypeECC:
+		scheme = tpm2.TPMTSigScheme{
+			Scheme:  tpm2.TPMAlgECDSA,
+			Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgECDSA, &hashAlg),
+		}
+
+	case TypeHMAC:
+		return k.run(func() ([]byte, error) {
+			return k.hmacLocked(digest)
+		})
+
+	default:
+		return nil, ErrWrongKeyType
+	}
+
+	sig, err := k.run(func() ([]byte, error) {
+		return k.signLocked(digest, scheme)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if scheme.Scheme == tpm2.TPMAlgRSAPSS {
+		// Older TPMs use the longest possible salt.
+		if err := rsa.VerifyPSS(k.publicKey.(*rsa.PublicKey), h, digest, sig, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}); err != nil {
+			return nil, fmt.Errorf("TPM2_Sign: unexpected pss salt length: %w", err)
+		}
+	}
+	return sig, nil
+}
+
+func (k *Key) signLocked(digest []byte, scheme tpm2.TPMTSigScheme) ([]byte, error) {
+	sess, err := k.t.keySessionLocked(false)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := tpm2.Sign{
+		KeyHandle: tpm2.AuthHandle{
+			Handle: k.t.loadedHandle,
+			Name:   k.name,
+			Auth:   sess,
+		},
+		Digest: tpm2.TPM2BDigest{
+			Buffer: digest,
+		},
+		InScheme: scheme,
+		Validation: tpm2.TPMTTKHashCheck{
+			Tag: tpm2.TPMSTHashCheck,
+		},
+	}.Execute(k.t.tpm)
+	if err != nil {
+		return nil, tpmError("TPM2_Sign", err)
+	}
+	switch resp.Signature.SigAlg {
+	case tpm2.TPMAlgRSASSA:
+		sig, err := resp.Signature.Signature.RSASSA()
 		if err != nil {
-			return nil, fmt.Errorf("TPM2_Sign: %w", err)
+			return nil, err
 		}
-		if resp.Signature.SigAlg == tpm2.TPMAlgRSASSA {
-			sig, err := resp.Signature.Signature.RSASSA()
-			if err != nil {
-				return nil, err
-			}
-			return sig.Sig.Buffer, nil
-		}
+		return sig.Sig.Buffer, nil
+
+	case tpm2.TPMAlgRSAPSS:
 		sig, err := resp.Signature.Signature.RSAPSS()
 		if err != nil {
 			return nil, err
 		}
 		return sig.Sig.Buffer, nil
 
-	case TypeECC:
-		resp, err := tpm2.Sign{
-			KeyHandle: tpm2.AuthHandle{
-				Handle: k.t.loadedHandle,
-				Name: tpm2.TPM2BName{
-					Buffer: []byte(k.id),
-				},
-				Auth: tpm2.PasswordAuth(k.t.objectAuth),
-			},
-			Digest: tpm2.TPM2BDigest{
-				Buffer: digest,
-			},
-			InScheme: tpm2.TPMTSigScheme{
-				Scheme:  tpm2.TPMAlgECDSA,
-				Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgECDSA, &hashAlg),
-			},
-			Validation: tpm2.TPMTTKHashCheck{
-				Tag: tpm2.TPMSTHashCheck,
-			},
-		}.Execute(k.t.tpm)
-		if err != nil {
-			return nil, fmt.Errorf("TPM2_Sign: %w", err)
-		}
+	case tpm2.TPMAlgECDSA:
 		sig, err := resp.Signature.Signature.ECDSA()
 		if err != nil {
 			return nil, err
@@ -839,11 +1082,8 @@ func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signatur
 		})
 		return b.Bytes()
 
-	case TypeHMAC:
-		return k.hmacLocked(digest)
-
 	default:
-		return nil, ErrWrongKeyType
+		return nil, fmt.Errorf("TPM2_Sign: unexpected signature algorithm %v", resp.Signature.SigAlg)
 	}
 }
 
@@ -868,58 +1108,27 @@ func addASN1IntBytes(b *cryptobyte.Builder, bytes []byte) {
 }
 
 // Encrypt encrypts cleartext with the key.
+//
+// With RSA keys, the cleartext is encrypted with RSA-OAEP (SHA-256) and its
+// size is limited by the key size.
+//
+// With AES keys, the cleartext is encrypted with authenticated encryption
+// (AES-GCM) using a single-use data key that is wrapped by the TPM key. There
+// is no practical size limit.
 func (k *Key) Encrypt(cleartext []byte) (ciphertext []byte, err error) {
-	k.t.mu.Lock()
-	defer k.t.mu.Unlock()
-	if err := k.loadLocked(); err != nil {
-		return nil, err
+	if k.keyType == TypeRSA && !k.canDecrypt {
+		return nil, ErrKeyUsage
 	}
 	switch k.keyType {
 	case TypeRSA:
-		resp, err := tpm2.RSAEncrypt{
-			KeyHandle: k.t.loadedHandle,
-			Message: tpm2.TPM2BPublicKeyRSA{
-				Buffer: cleartext,
-			},
-			InScheme: tpm2.TPMTRSADecrypt{
-				Scheme:  tpm2.TPMAlgOAEP,
-				Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgOAEP, &tpm2.TPMSEncSchemeOAEP{HashAlg: tpm2.TPMAlgSHA256}),
-			},
-		}.Execute(k.t.tpm)
-		if err != nil {
-			return nil, fmt.Errorf("TPM2_RSAEncrypt: %w", err)
-		}
-		return resp.OutData.Buffer, nil
+		// Only the public key is needed. Encrypting in software keeps
+		// the cleartext off the bus.
+		return rsa.EncryptOAEP(sha256.New(), rand.Reader, k.publicKey.(*rsa.PublicKey), cleartext, nil)
 
 	case TypeAES:
-		iv := make([]byte, 16)
-		if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-			return nil, fmt.Errorf("rand: %w", err)
-		}
-		resp, err := tpm2.EncryptDecrypt2{
-			KeyHandle: tpm2.AuthHandle{
-				Handle: k.t.loadedHandle,
-				Name: tpm2.TPM2BName{
-					Buffer: []byte(k.id),
-				},
-				Auth: tpm2.PasswordAuth(k.t.objectAuth),
-			},
-			Message: tpm2.TPM2BMaxBuffer{
-				Buffer: cleartext,
-			},
-			Decrypt: false,
-			IV: tpm2.TPM2BIV{
-				Buffer: iv,
-			},
-		}.Execute(k.t.tpm)
-		if err != nil {
-			return nil, fmt.Errorf("TPM2_EncryptDecrypt2: %w", err)
-		}
-		enc := resp.OutData.Buffer
-		out := make([]byte, len(iv)+len(enc))
-		copy(out, iv)
-		copy(out[len(iv):], enc)
-		return out, nil
+		return k.run(func() ([]byte, error) {
+			return k.aesEncryptLocked(cleartext)
+		})
 
 	default:
 		return nil, ErrWrongKeyType
@@ -927,81 +1136,288 @@ func (k *Key) Encrypt(cleartext []byte) (ciphertext []byte, err error) {
 }
 
 // Decrypt decrypts ciphertext with the key.
-func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (plaintext []byte, err error) {
-	k.t.mu.Lock()
-	defer k.t.mu.Unlock()
-	if err := k.loadLocked(); err != nil {
-		return nil, err
+//
+// With RSA keys, only RSA-OAEP is supported. opts may be nil (SHA-256, no
+// label) or a [*rsa.OAEPOptions]. The TPM requires OAEP labels to be
+// null-terminated, so a non-empty Label must end with a 0x00 byte.
+func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, opts crypto.DecrypterOpts) (plaintext []byte, err error) {
+	if k.keyType == TypeRSA && !k.canDecrypt {
+		return nil, ErrKeyUsage
 	}
 	switch k.keyType {
 	case TypeRSA:
-		resp, err := tpm2.RSADecrypt{
-			KeyHandle: tpm2.AuthHandle{
-				Handle: k.t.loadedHandle,
-				Name: tpm2.TPM2BName{
-					Buffer: []byte(k.id),
-				},
-				Auth: tpm2.PasswordAuth(k.t.objectAuth),
-			},
-			CipherText: tpm2.TPM2BPublicKeyRSA{
-				Buffer: ciphertext,
-			},
-			InScheme: tpm2.TPMTRSADecrypt{
-				Scheme:  tpm2.TPMAlgOAEP,
-				Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgOAEP, &tpm2.TPMSEncSchemeOAEP{HashAlg: tpm2.TPMAlgSHA256}),
-			},
-		}.Execute(k.t.tpm)
+		hashAlg, label, err := oaepParams(opts)
 		if err != nil {
-			return nil, fmt.Errorf("TPM2_RSADecrypt: %w", err)
+			return nil, err
 		}
-		return resp.Message.Buffer, nil
+		return k.run(func() ([]byte, error) {
+			return k.rsaDecryptLocked(ciphertext, hashAlg, label)
+		})
 
 	case TypeAES:
-		if len(ciphertext) < 16 {
-			return nil, ErrDecrypt
-		}
-		resp, err := tpm2.EncryptDecrypt2{
-			KeyHandle: tpm2.AuthHandle{
-				Handle: k.t.loadedHandle,
-				Name: tpm2.TPM2BName{
-					Buffer: []byte(k.id),
-				},
-				Auth: tpm2.PasswordAuth(k.t.objectAuth),
-			},
-			Message: tpm2.TPM2BMaxBuffer{
-				Buffer: ciphertext[16:],
-			},
-			Decrypt: true,
-			IV: tpm2.TPM2BIV{
-				Buffer: ciphertext[:16],
-			},
-		}.Execute(k.t.tpm)
-		if err != nil {
-			return nil, fmt.Errorf("TPM2_EncryptDecrypt2: %w", err)
-		}
-		return resp.OutData.Buffer, nil
+		return k.run(func() ([]byte, error) {
+			return k.aesDecryptLocked(ciphertext)
+		})
 
 	default:
 		return nil, ErrWrongKeyType
 	}
 }
 
-func (t *TPM) srk() (tpm2.NamedHandle, func(), error) {
+func (k *Key) rsaDecryptLocked(ciphertext []byte, hashAlg tpm2.TPMIAlgHash, label []byte) ([]byte, error) {
+	sess, err := k.t.keySessionLocked(true)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := tpm2.RSADecrypt{
+		KeyHandle: tpm2.AuthHandle{
+			Handle: k.t.loadedHandle,
+			Name:   k.name,
+			Auth:   sess,
+		},
+		CipherText: tpm2.TPM2BPublicKeyRSA{
+			Buffer: ciphertext,
+		},
+		InScheme: tpm2.TPMTRSADecrypt{
+			Scheme:  tpm2.TPMAlgOAEP,
+			Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgOAEP, &tpm2.TPMSEncSchemeOAEP{HashAlg: hashAlg}),
+		},
+		Label: tpm2.TPM2BData{
+			Buffer: label,
+		},
+	}.Execute(k.t.tpm)
+	if err != nil {
+		return nil, tpmError("TPM2_RSADecrypt", err)
+	}
+	return resp.Message.Buffer, nil
+}
+
+// oaepParams returns the TPM hash algorithm and label to use for RSA-OAEP
+// decryption with the given options.
+func oaepParams(opts crypto.DecrypterOpts) (tpm2.TPMIAlgHash, []byte, error) {
+	if opts == nil {
+		return tpm2.TPMAlgSHA256, nil, nil
+	}
+	o, ok := opts.(*rsa.OAEPOptions)
+	if !ok {
+		return 0, nil, fmt.Errorf("unsupported decrypter options %T", opts)
+	}
+	if o.MGFHash != 0 && o.MGFHash != o.Hash {
+		return 0, nil, errors.New("OAEP MGF hash must be the same as the label hash")
+	}
+	hashAlg, err := tpmHashAlg(o.Hash)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(o.Label) > 0 && o.Label[len(o.Label)-1] != 0 {
+		return 0, nil, errors.New("OAEP label must be null-terminated")
+	}
+	return hashAlg, o.Label, nil
+}
+
+func tpmHashAlg(h crypto.Hash) (tpm2.TPMIAlgHash, error) {
+	switch h {
+	case crypto.SHA1:
+		return tpm2.TPMAlgSHA1, nil
+	case crypto.SHA256:
+		return tpm2.TPMAlgSHA256, nil
+	case crypto.SHA384:
+		return tpm2.TPMAlgSHA384, nil
+	case crypto.SHA512:
+		return tpm2.TPMAlgSHA512, nil
+	default:
+		return 0, fmt.Errorf("unexpected hash %v", h)
+	}
+}
+
+// AES ciphertext format:
+//
+//	version (1) || iv (16) || wrapped data key (32) || AES-GCM ciphertext+tag
+//
+// A random data key is generated for each message and wrapped (AES-CFB) by the
+// TPM key. The message itself is sealed with AES-GCM in software, using a key
+// derived from the data key. The data key is never reused, so a fixed nonce is
+// safe. The header is authenticated as additional data.
+const (
+	aesVersion    = 1
+	aesIVSize     = 16
+	aesDataKeyLen = 32
+	aesHeaderSize = 1 + aesIVSize + aesDataKeyLen
+)
+
+func (k *Key) aesEncryptLocked(cleartext []byte) ([]byte, error) {
+	header := make([]byte, aesHeaderSize)
+	header[0] = aesVersion
+	iv := header[1 : 1+aesIVSize]
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return nil, fmt.Errorf("rand: %w", err)
+	}
+	dataKey := make([]byte, aesDataKeyLen)
+	if _, err := io.ReadFull(rand.Reader, dataKey); err != nil {
+		return nil, fmt.Errorf("rand: %w", err)
+	}
+	wrapped, err := k.tpmAESLocked(dataKey, iv, false)
+	if err != nil {
+		return nil, err
+	}
+	if len(wrapped) != aesDataKeyLen {
+		return nil, errors.New("TPM2_EncryptDecrypt2: unexpected output size")
+	}
+	copy(header[1+aesIVSize:], wrapped)
+
+	aead, err := newDataKeyAEAD(dataKey)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	out := make([]byte, aesHeaderSize, aesHeaderSize+len(cleartext)+aead.Overhead())
+	copy(out, header)
+	return aead.Seal(out, nonce, cleartext, header), nil
+}
+
+func (k *Key) aesDecryptLocked(ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) < aesHeaderSize || ciphertext[0] != aesVersion {
+		return nil, ErrDecrypt
+	}
+	header := ciphertext[:aesHeaderSize]
+	iv := header[1 : 1+aesIVSize]
+	dataKey, err := k.tpmAESLocked(header[1+aesIVSize:], iv, true)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := newDataKeyAEAD(dataKey)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	out, err := aead.Open(nil, nonce, ciphertext[aesHeaderSize:], header)
+	if err != nil {
+		return nil, ErrDecrypt
+	}
+	return out, nil
+}
+
+func newDataKeyAEAD(dataKey []byte) (cipher.AEAD, error) {
+	key, err := hkdf.Key(sha256.New, dataKey, nil, "github.com/c2FmZQ/tpm AES-GCM", 32)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func (k *Key) tpmAESLocked(in, iv []byte, decrypt bool) ([]byte, error) {
+	sess, err := k.t.keySessionLocked(true)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := tpm2.EncryptDecrypt2{
+		KeyHandle: tpm2.AuthHandle{
+			Handle: k.t.loadedHandle,
+			Name:   k.name,
+			Auth:   sess,
+		},
+		Message: tpm2.TPM2BMaxBuffer{
+			Buffer: in,
+		},
+		Decrypt: decrypt,
+		IV: tpm2.TPM2BIV{
+			Buffer: iv,
+		},
+	}.Execute(k.t.tpm)
+	if err != nil {
+		return nil, tpmError("TPM2_EncryptDecrypt2", err)
+	}
+	return resp.OutData.Buffer, nil
+}
+
+// srkLocked returns the storage root key (SRK), creating it if needed. The SRK
+// is the parent of all the keys, and it is used to salt the sessions that
+// protect the commands sent to the TPM. It stays loaded until Close.
+func (t *TPM) srkLocked() (tpm2.NamedHandle, error) {
+	if t.srk.Handle != 0 {
+		return t.srk, nil
+	}
 	createPrimaryResp, err := tpm2.CreatePrimary{
 		PrimaryHandle: tpm2.AuthHandle{
-			Handle: tpm2.TPMRHEndorsement,
-			Auth:   tpm2.PasswordAuth(t.endorsementAuth),
+			Handle: tpm2.TPMRHOwner,
+			// No salt is available yet. The HMAC session keeps
+			// the owner auth value off the bus.
+			Auth: tpm2.HMAC(tpm2.TPMAlgSHA256, 16, tpm2.Auth(t.ownerAuth)),
 		},
 		InPublic: tpm2.New2B(tpm2.RSASRKTemplate),
 	}.Execute(t.tpm)
 	if err != nil {
-		return tpm2.NamedHandle{}, nil, fmt.Errorf("TPM2_CreatePrimary: %w", err)
+		return tpm2.NamedHandle{}, tpmError("TPM2_CreatePrimary", err)
 	}
-	srk := tpm2.NamedHandle{
+	flush := func() {
+		tpm2.FlushContext{FlushHandle: createPrimaryResp.ObjectHandle}.Execute(t.tpm)
+	}
+	pub, err := createPrimaryResp.OutPublic.Contents()
+	if err != nil {
+		flush()
+		return tpm2.NamedHandle{}, fmt.Errorf("TPM2_CreatePrimary: %w", err)
+	}
+	// The name is computed from the public area, instead of using the
+	// name from the response. Nothing authenticates the response, so the
+	// SRK is trusted on first use. See the package documentation.
+	name, err := tpm2.ObjectName(pub)
+	if err != nil {
+		flush()
+		return tpm2.NamedHandle{}, fmt.Errorf("TPM2_CreatePrimary: %w", err)
+	}
+	t.srk = tpm2.NamedHandle{
 		Handle: createPrimaryResp.ObjectHandle,
-		Name:   createPrimaryResp.Name,
+		Name:   *name,
 	}
-	return srk, func() {
-		tpm2.FlushContext{FlushHandle: srk}.Execute(t.tpm)
-	}, nil
+	t.srkPublic = *pub
+	return t.srk, nil
+}
+
+// sessionLocked returns a one-time HMAC session, salted with the SRK, to
+// authorize the use of an object with the given auth value. The auth value is
+// never sent to the TPM, the TPM's response is authenticated, and opts can
+// enable encryption of the first command and/or response parameter. The SRK
+// must already be loaded.
+//
+// Starting a salted session is expensive. Keys are used with the reusable
+// sessions from keySessionLocked instead.
+func (t *TPM) sessionLocked(auth []byte, opts ...tpm2.AuthOption) tpm2.Session {
+	opts = append([]tpm2.AuthOption{
+		tpm2.Auth(auth),
+		tpm2.Salted(t.srk.Handle, t.srkPublic),
+	}, opts...)
+	return tpm2.HMAC(tpm2.TPMAlgSHA256, 16, opts...)
+}
+
+// keySessionLocked returns a reusable HMAC session, salted with the SRK, to
+// authorize the use of a key, like sessionLocked. The command parameter is
+// encrypted, and so is the response parameter if encryptResponse is true.
+// The TPM rejects sessions that encrypt the response of commands that can't
+// encrypt it, like TPM2_Sign.
+func (t *TPM) keySessionLocked(encryptResponse bool) (tpm2.Session, error) {
+	p, dir := &t.inSession, tpm2.EncryptIn
+	if encryptResponse {
+		p, dir = &t.inOutSession, tpm2.EncryptInOut
+	}
+	if p.s != nil {
+		return p.s, nil
+	}
+	srk, err := t.srkLocked()
+	if err != nil {
+		return nil, err
+	}
+	s, closer, err := tpm2.HMACSession(t.tpm, tpm2.TPMAlgSHA256, 16,
+		tpm2.Auth(t.objectAuth),
+		tpm2.Salted(srk.Handle, t.srkPublic),
+		tpm2.AESEncryption(128, dir),
+	)
+	if err != nil {
+		return nil, tpmError("TPM2_StartAuthSession", err)
+	}
+	*p = session{s: s, close: closer}
+	return s, nil
 }
