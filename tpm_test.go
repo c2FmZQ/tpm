@@ -665,3 +665,115 @@ func TestRejectKnownSensitiveKey(t *testing.T) {
 		t.Fatalf("tpm.UnmarshalKey: got %v, want %v", err, ErrInvalidKey)
 	}
 }
+
+func TestKeyUsage(t *testing.T) {
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+	tpm, err := New(WithTPM(rwc))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	payload := []byte("Hello World!")
+	hashed := sha256.Sum256(payload)
+
+	t.Run("RSA signing only", func(t *testing.T) {
+		key, err := tpm.CreateKey(WithRSA(2048), WithSigningOnly())
+		if err != nil {
+			t.Fatalf("tpm.CreateKey: %v", err)
+		}
+		sig, err := key.Sign(nil, hashed[:], crypto.SHA256)
+		if err != nil {
+			t.Fatalf("key.Sign: %v", err)
+		}
+		if err := rsa.VerifyPKCS1v15(key.Public().(*rsa.PublicKey), crypto.SHA256, hashed[:], sig); err != nil {
+			t.Fatalf("VerifyPKCS1v15: %v", err)
+		}
+		if _, err := key.Encrypt(payload); !errors.Is(err, ErrKeyUsage) {
+			t.Fatalf("key.Encrypt: got %v, want %v", err, ErrKeyUsage)
+		}
+		enc, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, key.Public().(*rsa.PublicKey), payload, nil)
+		if err != nil {
+			t.Fatalf("rsa.EncryptOAEP: %v", err)
+		}
+		if _, err := key.Decrypt(nil, enc, nil); !errors.Is(err, ErrKeyUsage) {
+			t.Fatalf("key.Decrypt: got %v, want %v", err, ErrKeyUsage)
+		}
+		// The TPM enforces it too.
+		key.canDecrypt = true
+		if _, err := key.Decrypt(nil, enc, nil); err == nil {
+			t.Fatal("TPM decrypted with a signing-only key")
+		}
+	})
+
+	t.Run("RSA decryption only", func(t *testing.T) {
+		key, err := tpm.CreateKey(WithRSA(2048), WithDecryptionOnly())
+		if err != nil {
+			t.Fatalf("tpm.CreateKey: %v", err)
+		}
+		enc, err := key.Encrypt(payload)
+		if err != nil {
+			t.Fatalf("key.Encrypt: %v", err)
+		}
+		dec, err := key.Decrypt(nil, enc, nil)
+		if err != nil {
+			t.Fatalf("key.Decrypt: %v", err)
+		}
+		if !bytes.Equal(dec, payload) {
+			t.Fatalf("key.Decrypt() = %q, want %q", dec, payload)
+		}
+		if _, err := key.Sign(nil, hashed[:], crypto.SHA256); !errors.Is(err, ErrKeyUsage) {
+			t.Fatalf("key.Sign: got %v, want %v", err, ErrKeyUsage)
+		}
+		// The TPM enforces it too.
+		key.canSign = true
+		if _, err := key.Sign(nil, hashed[:], crypto.SHA256); err == nil {
+			t.Fatal("TPM signed with a decryption-only key")
+		}
+		// Only the key's scheme (OAEP) can be used, not raw RSA.
+		tpm.mu.Lock()
+		_, err = tpm2.RSADecrypt{
+			KeyHandle: tpm2.AuthHandle{
+				Handle: tpm.loadedHandle,
+				Name:   key.name,
+				Auth:   tpm.sessionLocked(nil),
+			},
+			CipherText: tpm2.TPM2BPublicKeyRSA{Buffer: enc},
+			InScheme:   tpm2.TPMTRSADecrypt{Scheme: tpm2.TPMAlgRSAES},
+		}.Execute(tpm.tpm)
+		tpm.mu.Unlock()
+		if err == nil {
+			t.Fatal("TPM decrypted with a scheme other than the key's scheme")
+		}
+	})
+
+	t.Run("ECC signing only", func(t *testing.T) {
+		key, err := tpm.CreateKey(WithECC(elliptic.P256()), WithSigningOnly())
+		if err != nil {
+			t.Fatalf("tpm.CreateKey: %v", err)
+		}
+		sig, err := key.Sign(nil, hashed[:], crypto.SHA256)
+		if err != nil {
+			t.Fatalf("key.Sign: %v", err)
+		}
+		if !ecdsa.VerifyASN1(key.Public().(*ecdsa.PublicKey), hashed[:], sig) {
+			t.Fatal("VerifyASN1 failed")
+		}
+	})
+
+	t.Run("Unsupported", func(t *testing.T) {
+		for _, opts := range [][]KeyOption{
+			{WithECC(elliptic.P256()), WithDecryptionOnly()},
+			{WithAES(128), WithSigningOnly()},
+			{WithAES(128), WithDecryptionOnly()},
+			{WithHMAC(256), WithDecryptionOnly()},
+		} {
+			if _, err := tpm.CreateKey(opts...); err == nil {
+				t.Errorf("tpm.CreateKey should have failed")
+			}
+		}
+	})
+}

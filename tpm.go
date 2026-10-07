@@ -71,6 +71,7 @@ var (
 	ErrInvalidCurve = errors.New("invalid curve id")
 	ErrDecrypt      = errors.New("decryption error")
 	ErrInvalidKey   = errors.New("invalid or unsupported key")
+	ErrKeyUsage     = errors.New("operation not permitted by the key's usage")
 	ErrWrongTPM     = errors.New("key was created with a different TPM or storage root key")
 )
 
@@ -173,7 +174,16 @@ type keyOptions struct {
 	keyType KeyType
 	bits    int
 	curve   elliptic.Curve
+	usage   keyUsage
 }
+
+type keyUsage int
+
+const (
+	usageAny keyUsage = iota
+	usageSign
+	usageDecrypt
+)
 
 // KeyOption is an option that can be passed to CreateKey.
 type KeyOption func(*keyOptions)
@@ -193,6 +203,29 @@ func WithECC(curve elliptic.Curve) KeyOption {
 		opts.keyType = TypeECC
 		opts.bits = 0
 		opts.curve = curve
+	}
+}
+
+// WithSigningOnly restricts a new RSA or ECC key to signing. The key can't be
+// used to decrypt.
+//
+// By default, RSA and ECC keys can be used for both signing and decryption.
+// The TPM requires such dual-use keys to have no fixed scheme, so they can
+// also be used with other schemes than the ones that this package uses (e.g.
+// raw RSA decryption), by anyone who can use the key directly with the TPM.
+func WithSigningOnly() KeyOption {
+	return func(opts *keyOptions) {
+		opts.usage = usageSign
+	}
+}
+
+// WithDecryptionOnly restricts a new RSA key to RSA-OAEP decryption with
+// SHA-256. The key can't be used to sign.
+//
+// See [WithSigningOnly].
+func WithDecryptionOnly() KeyOption {
+	return func(opts *keyOptions) {
+		opts.usage = usageDecrypt
 	}
 }
 
@@ -235,6 +268,13 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 	for _, o := range opts {
 		o(&opt)
 	}
+	switch {
+	case opt.usage == usageAny:
+	case opt.keyType == TypeRSA:
+	case opt.keyType == TypeECC && opt.usage == usageSign:
+	default:
+		return nil, fmt.Errorf("key usage not supported with %s keys", opt.keyType)
+	}
 	t.flushLocked()
 
 	srk, err := t.srkLocked()
@@ -246,6 +286,16 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 
 	switch opt.keyType {
 	case TypeRSA:
+		rsaScheme := tpm2.TPMTRSAScheme{Scheme: tpm2.TPMAlgNull}
+		if opt.usage == usageDecrypt {
+			rsaScheme = tpm2.TPMTRSAScheme{
+				Scheme: tpm2.TPMAlgOAEP,
+				Details: tpm2.NewTPMUAsymScheme(
+					tpm2.TPMAlgOAEP,
+					&tpm2.TPMSEncSchemeOAEP{HashAlg: tpm2.TPMAlgSHA256},
+				),
+			}
+		}
 		unique := make([]byte, opt.bits/8)
 		if _, err := io.ReadFull(rand.Reader, unique); err != nil {
 			return nil, fmt.Errorf("rand: %w", err)
@@ -263,12 +313,13 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 				NoDA:                 false,
 				EncryptedDuplication: false,
 				Restricted:           false,
-				Decrypt:              true,
-				SignEncrypt:          true,
+				Decrypt:              opt.usage != usageSign,
+				SignEncrypt:          opt.usage != usageDecrypt,
 			},
 			Parameters: tpm2.NewTPMUPublicParms(
 				tpm2.TPMAlgRSA,
 				&tpm2.TPMSRSAParms{
+					Scheme:  rsaScheme,
 					KeyBits: tpm2.TPMKeyBits(opt.bits),
 				},
 			),
@@ -317,7 +368,7 @@ func (t *TPM) createLocked(opts ...KeyOption) ([]byte, error) {
 				NoDA:                 false,
 				EncryptedDuplication: false,
 				Restricted:           false,
-				Decrypt:              true,
+				Decrypt:              opt.usage != usageSign,
 				SignEncrypt:          true,
 			},
 			Parameters: tpm2.NewTPMUPublicParms(
@@ -568,16 +619,18 @@ var _ crypto.Signer = (*Key)(nil)
 // Key performs cryptographic operations via the TPM. It implements the
 // [crypto.Signer] and [crypto.Decrypter] interfaces.
 type Key struct {
-	t         *TPM
-	id        string
-	name      tpm2.TPM2BName
-	priv      tpm2.TPM2BPrivate
-	pub       tpm2.TPM2BPublic
-	keyb      []byte
-	keyType   KeyType
-	bits      int
-	curve     elliptic.Curve
-	publicKey crypto.PublicKey
+	t          *TPM
+	id         string
+	name       tpm2.TPM2BName
+	priv       tpm2.TPM2BPrivate
+	pub        tpm2.TPM2BPublic
+	keyb       []byte
+	keyType    KeyType
+	bits       int
+	curve      elliptic.Curve
+	publicKey  crypto.PublicKey
+	canSign    bool
+	canDecrypt bool
 }
 
 func (k *Key) loadLocked() error {
@@ -622,6 +675,8 @@ func (k *Key) parsePublic(outPublic *tpm2.TPMTPublic) error {
 	if !attrs.FixedTPM || !attrs.FixedParent || !attrs.SensitiveDataOrigin || !attrs.UserWithAuth {
 		return ErrInvalidKey
 	}
+	k.canSign = attrs.SignEncrypt
+	k.canDecrypt = attrs.Decrypt
 	switch tpm2.TPMAlgID(outPublic.Type) {
 	case tpm2.TPMAlgRSA:
 		rsaParms, err := outPublic.Parameters.RSADetail()
@@ -776,6 +831,9 @@ func (k *Key) hmacLocked(message []byte) ([]byte, error) {
 // Sign signs a digest with the key (RSA and ECC) or computes the HMAC
 // (HMAC keys).
 func (k *Key) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
+	if !k.canSign {
+		return nil, ErrKeyUsage
+	}
 	k.t.mu.Lock()
 	defer k.t.mu.Unlock()
 	if err := k.loadLocked(); err != nil {
@@ -908,6 +966,9 @@ func addASN1IntBytes(b *cryptobyte.Builder, bytes []byte) {
 // (AES-GCM) using a single-use data key that is wrapped by the TPM key. There
 // is no practical size limit.
 func (k *Key) Encrypt(cleartext []byte) (ciphertext []byte, err error) {
+	if k.keyType == TypeRSA && !k.canDecrypt {
+		return nil, ErrKeyUsage
+	}
 	switch k.keyType {
 	case TypeRSA:
 		// Only the public key is needed. Encrypting in software keeps
@@ -933,6 +994,9 @@ func (k *Key) Encrypt(cleartext []byte) (ciphertext []byte, err error) {
 // label) or a [*rsa.OAEPOptions]. The TPM requires OAEP labels to be
 // null-terminated, so a non-empty Label must end with a 0x00 byte.
 func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, opts crypto.DecrypterOpts) (plaintext []byte, err error) {
+	if k.keyType == TypeRSA && !k.canDecrypt {
+		return nil, ErrKeyUsage
+	}
 	k.t.mu.Lock()
 	defer k.t.mu.Unlock()
 	if err := k.loadLocked(); err != nil {
