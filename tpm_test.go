@@ -31,12 +31,15 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"testing"
 
 	"github.com/google/go-tpm-tools/simulator"
 	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/transport"
 )
 
 func TestRSA(t *testing.T) {
@@ -465,12 +468,128 @@ func TestClearInvalidatesKeys(t *testing.T) {
 			Auth:   tpm2.PasswordAuth(nil),
 		},
 	}.Execute(tpm.tpm)
+	// TPM2_Clear flushed the SRK.
+	tpm.srk = tpm2.NamedHandle{}
 	tpm.mu.Unlock()
 	if err != nil {
 		t.Fatalf("TPM2_Clear: %v", err)
 	}
 
-	if _, err := tpm.UnmarshalKey(b); err == nil {
-		t.Fatal("tpm.UnmarshalKey should fail after TPM2_Clear")
+	if _, err := tpm.UnmarshalKey(b); !errors.Is(err, ErrWrongTPM) {
+		t.Fatalf("tpm.UnmarshalKey after TPM2_Clear: got %v, want %v", err, ErrWrongTPM)
+	}
+}
+
+func TestWrongTPM(t *testing.T) {
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+	tpm, err := New(WithTPM(rwc))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	key, err := tpm.CreateKey()
+	if err != nil {
+		t.Fatalf("tpm.CreateKey: %v", err)
+	}
+	b, err := key.Marshal()
+	if err != nil {
+		t.Fatalf("key.Marshal: %v", err)
+	}
+	tpm.Close()
+
+	rwc2, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+	other, err := New(WithTPM(rwc2))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer other.Close()
+	if _, err := other.UnmarshalKey(b); !errors.Is(err, ErrWrongTPM) {
+		t.Fatalf("tpm.UnmarshalKey on different TPM: got %v, want %v", err, ErrWrongTPM)
+	}
+}
+
+// recorder records all the bytes exchanged with the TPM.
+type recorder struct {
+	io.ReadWriteCloser
+	buf bytes.Buffer
+}
+
+func (r *recorder) Read(b []byte) (int, error) {
+	n, err := r.ReadWriteCloser.Read(b)
+	r.buf.Write(b[:n])
+	return n, err
+}
+
+func (r *recorder) Write(b []byte) (int, error) {
+	r.buf.Write(b)
+	return r.ReadWriteCloser.Write(b)
+}
+
+func TestBusConfidentiality(t *testing.T) {
+	var (
+		ownerAuth  = []byte("owner-secret-passphrase")
+		objectAuth = []byte("object-secret-passphrase")
+		payload    = []byte("very-secret-payload-0123456789")
+	)
+
+	sim, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+	if _, err := (tpm2.HierarchyChangeAuth{
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		NewAuth: tpm2.TPM2BAuth{Buffer: ownerAuth},
+	}).Execute(transport.FromReadWriteCloser(sim)); err != nil {
+		t.Fatalf("TPM2_HierarchyChangeAuth: %v", err)
+	}
+	rec := &recorder{ReadWriteCloser: sim}
+
+	tpm, err := New(WithTPM(rec), WithOwnerAuth(ownerAuth), WithObjectAuth(objectAuth))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	for _, opt := range []KeyOption{WithRSA(2048), WithAES(128), WithHMAC(256)} {
+		key, err := tpm.CreateKey(opt)
+		if err != nil {
+			t.Fatalf("tpm.CreateKey: %v", err)
+		}
+		switch key.Type() {
+		case TypeRSA, TypeAES:
+			enc, err := key.Encrypt(payload)
+			if err != nil {
+				t.Fatalf("key.Encrypt: %v", err)
+			}
+			dec, err := key.Decrypt(nil, enc, nil)
+			if err != nil {
+				t.Fatalf("key.Decrypt: %v", err)
+			}
+			if !bytes.Equal(dec, payload) {
+				t.Fatalf("key.Decrypt() = %q, want %q", dec, payload)
+			}
+		case TypeHMAC:
+			mac, err := key.HMAC(payload)
+			if err != nil {
+				t.Fatalf("key.HMAC: %v", err)
+			}
+			if bytes.Contains(rec.buf.Bytes(), mac) {
+				t.Error("HMAC output seen on the bus")
+			}
+		}
+	}
+
+	for _, secret := range [][]byte{ownerAuth, objectAuth, payload} {
+		if bytes.Contains(rec.buf.Bytes(), secret) {
+			t.Errorf("%q seen on the bus", secret)
+		}
 	}
 }
