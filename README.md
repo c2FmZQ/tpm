@@ -17,6 +17,12 @@ in cleartext, secret parameters are encrypted, and responses are
 authenticated. Serialized keys are bound to the SRK that they were created
 under.
 
+The SRK itself is trusted on first use: this package doesn't verify that it
+belongs to a genuine TPM (e.g. with the endorsement key's certificate). A
+device that impersonates the TPM when a key is created can capture that key's
+auth value and parameters. Once a key exists, a different device can't use it,
+or complete the sessions that protect it.
+
 ## Example:
 
 ```go

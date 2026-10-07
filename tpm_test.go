@@ -32,6 +32,8 @@ import (
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/sha256"
+	_ "crypto/sha512"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -139,11 +141,11 @@ func TestRSA(t *testing.T) {
 			t.Fatalf("VerifyPSS: %v", err)
 		}
 
-		tpm.objectAuth = []byte("wrong")
+		setObjectAuth(tpm, []byte("wrong"))
 		if _, err := key.Decrypt(nil, enc, nil); err == nil {
 			t.Fatal("tpm.Decrypt should have failed")
 		}
-		tpm.objectAuth = []byte(keyPassphrase)
+		setObjectAuth(tpm, []byte(keyPassphrase))
 	}
 }
 
@@ -264,11 +266,11 @@ func TestAES(t *testing.T) {
 			t.Fatal("tpm.Decrypt should have failed with truncated ciphertext")
 		}
 
-		tpm.objectAuth = []byte("wrong")
+		setObjectAuth(tpm, []byte("wrong"))
 		if _, err := key.Decrypt(nil, enc, nil); err == nil {
 			t.Fatal("tpm.Decrypt should have failed")
 		}
-		tpm.objectAuth = []byte(keyPassphrase)
+		setObjectAuth(tpm, []byte(keyPassphrase))
 	}
 }
 
@@ -777,6 +779,22 @@ func TestKeyUsage(t *testing.T) {
 		}
 	})
 
+	t.Run("ECC default", func(t *testing.T) {
+		key, err := tpm.CreateKey(WithECC(elliptic.P256()))
+		if err != nil {
+			t.Fatalf("tpm.CreateKey: %v", err)
+		}
+		if !key.canSign || key.canDecrypt {
+			t.Fatalf("canSign = %v, canDecrypt = %v, want signing only", key.canSign, key.canDecrypt)
+		}
+	})
+
+	t.Run("Invalid curve", func(t *testing.T) {
+		if _, err := tpm.CreateKey(WithECC(nil)); !errors.Is(err, ErrInvalidCurve) {
+			t.Fatalf("tpm.CreateKey: got %v, want %v", err, ErrInvalidCurve)
+		}
+	})
+
 	t.Run("Unsupported", func(t *testing.T) {
 		for _, opts := range [][]KeyOption{
 			{WithECC(elliptic.P256()), WithDecryptionOnly()},
@@ -812,5 +830,184 @@ func TestNewKeepsOtherObjects(t *testing.T) {
 
 	if _, err := (tpm2.ReadPublic{ObjectHandle: other.ObjectHandle}).Execute(tpm.tpm); err != nil {
 		t.Fatalf("Object created before New is gone: %v", err)
+	}
+}
+
+// setObjectAuth changes the auth value that tpm uses with keys, as if it had
+// been created with a different WithObjectAuth.
+func setObjectAuth(tpm *TPM, auth []byte) {
+	tpm.mu.Lock()
+	defer tpm.mu.Unlock()
+	tpm.objectAuth = auth
+	tpm.resetLocked()
+}
+
+func TestRSAPSS(t *testing.T) {
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+	tpm, err := New(WithTPM(rwc))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	key, err := tpm.CreateKey(WithRSA(2048))
+	if err != nil {
+		t.Fatalf("tpm.CreateKey: %v", err)
+	}
+	pub := key.Public().(*rsa.PublicKey)
+
+	for _, h := range []crypto.Hash{crypto.SHA256, crypto.SHA384, crypto.SHA512} {
+		hh := h.New()
+		hh.Write([]byte("Hello World!"))
+		digest := hh.Sum(nil)
+
+		for _, saltLength := range []int{rsa.PSSSaltLengthAuto, rsa.PSSSaltLengthEqualsHash, h.Size()} {
+			sig, err := key.Sign(nil, digest, &rsa.PSSOptions{SaltLength: saltLength, Hash: h})
+			if err != nil {
+				t.Fatalf("Sign(%v, %d): %v", h, saltLength, err)
+			}
+			if err := rsa.VerifyPSS(pub, h, digest, sig, &rsa.PSSOptions{SaltLength: h.Size()}); err != nil {
+				t.Fatalf("VerifyPSS(%v, %d): %v", h, saltLength, err)
+			}
+		}
+		if _, err := key.Sign(nil, digest, &rsa.PSSOptions{SaltLength: h.Size() + 1, Hash: h}); err == nil {
+			t.Fatalf("Sign(%v) with unsupported salt length should have failed", h)
+		}
+	}
+}
+
+// cmdCounter counts the commands sent to the TPM.
+type cmdCounter struct {
+	io.ReadWriteCloser
+	counts map[tpm2.TPMCC]int
+}
+
+func (c *cmdCounter) Write(b []byte) (int, error) {
+	if len(b) >= 10 {
+		c.counts[tpm2.TPMCC(binary.BigEndian.Uint32(b[6:10]))]++
+	}
+	return c.ReadWriteCloser.Write(b)
+}
+
+func TestSessionReuse(t *testing.T) {
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+	counter := &cmdCounter{ReadWriteCloser: rwc, counts: make(map[tpm2.TPMCC]int)}
+	tpm, err := New(WithTPM(counter), WithObjectAuth([]byte("passphrase")))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	key1, err := tpm.CreateKey(WithRSA(2048))
+	if err != nil {
+		t.Fatalf("tpm.CreateKey: %v", err)
+	}
+	key2, err := tpm.CreateKey(WithAES(128))
+	if err != nil {
+		t.Fatalf("tpm.CreateKey: %v", err)
+	}
+	hashed := sha256.Sum256([]byte("Hello World!"))
+	use := func() {
+		if _, err := key1.Sign(nil, hashed[:], crypto.SHA256); err != nil {
+			t.Fatalf("key1.Sign: %v", err)
+		}
+		enc, err := key1.Encrypt([]byte("Hello World!"))
+		if err != nil {
+			t.Fatalf("key1.Encrypt: %v", err)
+		}
+		if _, err := key1.Decrypt(nil, enc, nil); err != nil {
+			t.Fatalf("key1.Decrypt: %v", err)
+		}
+		if enc, err = key2.Encrypt([]byte("Hello World!")); err != nil {
+			t.Fatalf("key2.Encrypt: %v", err)
+		}
+		if _, err := key2.Decrypt(nil, enc, nil); err != nil {
+			t.Fatalf("key2.Decrypt: %v", err)
+		}
+	}
+	use()
+	clear(counter.counts)
+	for range 5 {
+		use()
+	}
+	if n := counter.counts[tpm2.TPMCCStartAuthSession]; n != 0 {
+		t.Errorf("TPM2_StartAuthSession called %d times, want 0", n)
+	}
+	if n := counter.counts[tpm2.TPMCCCreatePrimary]; n != 0 {
+		t.Errorf("TPM2_CreatePrimary called %d times, want 0", n)
+	}
+}
+
+func TestRecoverFlushedHandles(t *testing.T) {
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+	tpm, err := New(WithTPM(rwc))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	key, err := tpm.CreateKey(WithRSA(2048))
+	if err != nil {
+		t.Fatalf("tpm.CreateKey: %v", err)
+	}
+	hashed := sha256.Sum256([]byte("Hello World!"))
+	enc, err := key.Encrypt([]byte("Hello World!"))
+	if err != nil {
+		t.Fatalf("key.Encrypt: %v", err)
+	}
+	if _, err := key.Sign(nil, hashed[:], crypto.SHA256); err != nil {
+		t.Fatalf("key.Sign: %v", err)
+	}
+	if _, err := key.Decrypt(nil, enc, nil); err != nil {
+		t.Fatalf("key.Decrypt: %v", err)
+	}
+
+	// Everything that the TPM object loaded disappears, e.g. because
+	// another user of the TPM flushed it.
+	raw := transport.FromReadWriteCloser(rwc)
+	if err := flushLeftoverHandles(raw); err != nil {
+		t.Fatalf("flushLeftoverHandles: %v", err)
+	}
+	for _, ht := range []tpm2.TPMHT{tpm2.TPMHTTransient, tpm2.TPMHTHMACSession, tpm2.TPMHTPolicySession} {
+		resp, err := tpm2.GetCapability{
+			Capability:    tpm2.TPMCapHandles,
+			Property:      uint32(ht) << 24,
+			PropertyCount: 100,
+		}.Execute(raw)
+		if err != nil {
+			t.Fatalf("TPM2_GetCapability: %v", err)
+		}
+		handles, err := resp.CapabilityData.Data.Handles()
+		if err != nil {
+			t.Fatalf("TPM2_GetCapability(Handles): %v", err)
+		}
+		if len(handles.Handle) != 0 {
+			t.Fatalf("Handles of type %v not flushed: %v", ht, handles.Handle)
+		}
+	}
+
+	if _, err := key.Sign(nil, hashed[:], crypto.SHA256); err != nil {
+		t.Fatalf("key.Sign after flush: %v", err)
+	}
+	if err := flushLeftoverHandles(raw); err != nil {
+		t.Fatalf("flushLeftoverHandles: %v", err)
+	}
+	if _, err := key.Decrypt(nil, enc, nil); err != nil {
+		t.Fatalf("key.Decrypt after flush: %v", err)
+	}
+	if err := flushLeftoverHandles(raw); err != nil {
+		t.Fatalf("flushLeftoverHandles: %v", err)
+	}
+	if _, err := tpm.CreateKey(WithECC(elliptic.P256())); err != nil {
+		t.Fatalf("tpm.CreateKey after flush: %v", err)
 	}
 }
