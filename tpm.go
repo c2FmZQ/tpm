@@ -98,10 +98,12 @@ func WithTPM(rwc io.ReadWriteCloser) Option {
 	}
 }
 
-// WithEndorsementAuth specifies the endorsement passphrase.
-func WithEndorsementAuth(pp []byte) Option {
+// WithOwnerAuth specifies the owner (storage hierarchy) passphrase. Keys are
+// created under a primary key in the owner hierarchy, so clearing the TPM
+// (TPM2_Clear) invalidates them.
+func WithOwnerAuth(pp []byte) Option {
 	return func(t *TPM) {
-		t.endorsementAuth = slices.Clone(pp)
+		t.ownerAuth = slices.Clone(pp)
 	}
 }
 
@@ -154,12 +156,12 @@ var _ io.Closer = (*TPM)(nil)
 // cryptographic keys that are bound to that TPM. The keys can never be used
 // without the TPM created them.
 type TPM struct {
-	mu              sync.Mutex
-	tpm             transport.TPMCloser
-	objectAuth      []byte
-	endorsementAuth []byte
-	loadedKey       string
-	loadedHandle    tpm2.TPMHandle
+	mu           sync.Mutex
+	tpm          transport.TPMCloser
+	objectAuth   []byte
+	ownerAuth    []byte
+	loadedKey    string
+	loadedHandle tpm2.TPMHandle
 }
 
 type keyOptions struct {
@@ -1099,8 +1101,8 @@ func (k *Key) tpmAESLocked(in, iv []byte, decrypt bool) ([]byte, error) {
 func (t *TPM) srk() (tpm2.NamedHandle, func(), error) {
 	createPrimaryResp, err := tpm2.CreatePrimary{
 		PrimaryHandle: tpm2.AuthHandle{
-			Handle: tpm2.TPMRHEndorsement,
-			Auth:   tpm2.PasswordAuth(t.endorsementAuth),
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth(t.ownerAuth),
 		},
 		InPublic: tpm2.New2B(tpm2.RSASRKTemplate),
 	}.Execute(t.tpm)

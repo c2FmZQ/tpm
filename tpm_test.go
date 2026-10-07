@@ -36,6 +36,7 @@ import (
 	"testing"
 
 	"github.com/google/go-tpm-tools/simulator"
+	"github.com/google/go-tpm/tpm2"
 )
 
 func TestRSA(t *testing.T) {
@@ -429,5 +430,47 @@ func TestMarshal(t *testing.T) {
 		if got, want := dec, []byte(fmt.Sprintf("Payload %d", i%10)); !bytes.Equal(got, want) {
 			t.Fatalf("tpm.Decrypt() = %q, want %q", got, want)
 		}
+	}
+}
+
+func TestClearInvalidatesKeys(t *testing.T) {
+	rwc, err := simulator.Get()
+	if err != nil {
+		t.Fatalf("simulator.Get: %v", err)
+	}
+
+	tpm, err := New(WithTPM(rwc))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tpm.Close()
+
+	key, err := tpm.CreateKey()
+	if err != nil {
+		t.Fatalf("tpm.CreateKey: %v", err)
+	}
+	b, err := key.Marshal()
+	if err != nil {
+		t.Fatalf("key.Marshal: %v", err)
+	}
+	if _, err := tpm.UnmarshalKey(b); err != nil {
+		t.Fatalf("tpm.UnmarshalKey: %v", err)
+	}
+
+	tpm.mu.Lock()
+	tpm.flushLocked()
+	_, err = tpm2.Clear{
+		AuthHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHLockout,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+	}.Execute(tpm.tpm)
+	tpm.mu.Unlock()
+	if err != nil {
+		t.Fatalf("TPM2_Clear: %v", err)
+	}
+
+	if _, err := tpm.UnmarshalKey(b); err == nil {
+		t.Fatal("tpm.UnmarshalKey should fail after TPM2_Clear")
 	}
 }
