@@ -910,7 +910,11 @@ func (k *Key) Encrypt(cleartext []byte) (ciphertext []byte, err error) {
 }
 
 // Decrypt decrypts ciphertext with the key.
-func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (plaintext []byte, err error) {
+//
+// With RSA keys, only RSA-OAEP is supported. opts may be nil (SHA-256, no
+// label) or a [*rsa.OAEPOptions]. The TPM requires OAEP labels to be
+// null-terminated, so a non-empty Label must end with a 0x00 byte.
+func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, opts crypto.DecrypterOpts) (plaintext []byte, err error) {
 	k.t.mu.Lock()
 	defer k.t.mu.Unlock()
 	if err := k.loadLocked(); err != nil {
@@ -918,6 +922,10 @@ func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (p
 	}
 	switch k.keyType {
 	case TypeRSA:
+		hashAlg, label, err := oaepParams(opts)
+		if err != nil {
+			return nil, err
+		}
 		resp, err := tpm2.RSADecrypt{
 			KeyHandle: tpm2.AuthHandle{
 				Handle: k.t.loadedHandle,
@@ -931,7 +939,10 @@ func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (p
 			},
 			InScheme: tpm2.TPMTRSADecrypt{
 				Scheme:  tpm2.TPMAlgOAEP,
-				Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgOAEP, &tpm2.TPMSEncSchemeOAEP{HashAlg: tpm2.TPMAlgSHA256}),
+				Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgOAEP, &tpm2.TPMSEncSchemeOAEP{HashAlg: hashAlg}),
+			},
+			Label: tpm2.TPM2BData{
+				Buffer: label,
 			},
 		}.Execute(k.t.tpm)
 		if err != nil {
@@ -944,6 +955,44 @@ func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (p
 
 	default:
 		return nil, ErrWrongKeyType
+	}
+}
+
+// oaepParams returns the TPM hash algorithm and label to use for RSA-OAEP
+// decryption with the given options.
+func oaepParams(opts crypto.DecrypterOpts) (tpm2.TPMIAlgHash, []byte, error) {
+	if opts == nil {
+		return tpm2.TPMAlgSHA256, nil, nil
+	}
+	o, ok := opts.(*rsa.OAEPOptions)
+	if !ok {
+		return 0, nil, fmt.Errorf("unsupported decrypter options %T", opts)
+	}
+	if o.MGFHash != 0 && o.MGFHash != o.Hash {
+		return 0, nil, errors.New("OAEP MGF hash must be the same as the label hash")
+	}
+	hashAlg, err := tpmHashAlg(o.Hash)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(o.Label) > 0 && o.Label[len(o.Label)-1] != 0 {
+		return 0, nil, errors.New("OAEP label must be null-terminated")
+	}
+	return hashAlg, o.Label, nil
+}
+
+func tpmHashAlg(h crypto.Hash) (tpm2.TPMIAlgHash, error) {
+	switch h {
+	case crypto.SHA1:
+		return tpm2.TPMAlgSHA1, nil
+	case crypto.SHA256:
+		return tpm2.TPMAlgSHA256, nil
+	case crypto.SHA384:
+		return tpm2.TPMAlgSHA384, nil
+	case crypto.SHA512:
+		return tpm2.TPMAlgSHA512, nil
+	default:
+		return 0, fmt.Errorf("unexpected hash %v", h)
 	}
 }
 

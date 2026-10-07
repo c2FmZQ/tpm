@@ -28,6 +28,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"fmt"
@@ -79,6 +80,35 @@ func TestRSA(t *testing.T) {
 		}
 
 		pub := key.Public()
+
+		// OAEP options are honored.
+		label := []byte("label\x00")
+		for _, h := range []crypto.Hash{crypto.SHA1, crypto.SHA256} {
+			enc, err := rsa.EncryptOAEP(h.New(), rand.Reader, pub.(*rsa.PublicKey), []byte(payload), label)
+			if err != nil {
+				t.Fatalf("rsa.EncryptOAEP: %v", err)
+			}
+			dec, err := key.Decrypt(nil, enc, &rsa.OAEPOptions{Hash: h, Label: label})
+			if err != nil {
+				t.Fatalf("tpm.Decrypt(%v, label): %v", h, err)
+			}
+			if got, want := string(dec), payload; got != want {
+				t.Fatalf("Decrypt() = %q, want %q", got, want)
+			}
+			if _, err := key.Decrypt(nil, enc, &rsa.OAEPOptions{Hash: h, Label: []byte("other\x00")}); err == nil {
+				t.Fatal("tpm.Decrypt with wrong label should have failed")
+			}
+			if _, err := key.Decrypt(nil, enc, &rsa.OAEPOptions{Hash: h}); err == nil {
+				t.Fatal("tpm.Decrypt without label should have failed")
+			}
+		}
+		if _, err := key.Decrypt(nil, enc, &rsa.OAEPOptions{Hash: crypto.SHA256, Label: []byte("label")}); err == nil {
+			t.Fatal("tpm.Decrypt with non-null-terminated label should have failed")
+		}
+		if _, err := key.Decrypt(nil, enc, &rsa.PKCS1v15DecryptOptions{}); err == nil {
+			t.Fatal("tpm.Decrypt with PKCS1v15 options should have failed")
+		}
+
 		hashed := sha256.Sum256([]byte(payload))
 		sig, err := key.Sign(nil, hashed[:], crypto.SHA256)
 		if err != nil {
