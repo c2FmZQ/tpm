@@ -31,6 +31,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/google/go-tpm-tools/simulator"
@@ -192,6 +193,32 @@ func TestAES(t *testing.T) {
 		}
 		if got, want := string(dec), payload; got != want {
 			t.Fatalf("Decrypt() = %q, want %q", got, want)
+		}
+
+		// Large messages are supported.
+		large := bytes.Repeat([]byte("x"), 100000)
+		encLarge, err := key.Encrypt(large)
+		if err != nil {
+			t.Fatalf("tpm.Encrypt(large): %v", err)
+		}
+		decLarge, err := key.Decrypt(nil, encLarge, nil)
+		if err != nil {
+			t.Fatalf("tpm.Decrypt(large): %v", err)
+		}
+		if !bytes.Equal(decLarge, large) {
+			t.Fatal("Decrypt(large) mismatch")
+		}
+
+		// Any modification of the ciphertext must be detected.
+		for i := range enc {
+			tampered := slices.Clone(enc)
+			tampered[i] ^= 0x01
+			if _, err := key.Decrypt(nil, tampered, nil); err == nil {
+				t.Fatalf("tpm.Decrypt should have failed with byte %d modified", i)
+			}
+		}
+		if _, err := key.Decrypt(nil, enc[:len(enc)-1], nil); err == nil {
+			t.Fatal("tpm.Decrypt should have failed with truncated ciphertext")
 		}
 
 		tpm.objectAuth = []byte("wrong")

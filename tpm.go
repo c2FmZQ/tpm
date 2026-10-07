@@ -34,8 +34,11 @@ package tpm
 
 import (
 	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -868,6 +871,13 @@ func addASN1IntBytes(b *cryptobyte.Builder, bytes []byte) {
 }
 
 // Encrypt encrypts cleartext with the key.
+//
+// With RSA keys, the cleartext is encrypted with RSA-OAEP (SHA-256) and its
+// size is limited by the key size.
+//
+// With AES keys, the cleartext is encrypted with authenticated encryption
+// (AES-GCM) using a single-use data key that is wrapped by the TPM key. There
+// is no practical size limit.
 func (k *Key) Encrypt(cleartext []byte) (ciphertext []byte, err error) {
 	k.t.mu.Lock()
 	defer k.t.mu.Unlock()
@@ -892,34 +902,7 @@ func (k *Key) Encrypt(cleartext []byte) (ciphertext []byte, err error) {
 		return resp.OutData.Buffer, nil
 
 	case TypeAES:
-		iv := make([]byte, 16)
-		if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-			return nil, fmt.Errorf("rand: %w", err)
-		}
-		resp, err := tpm2.EncryptDecrypt2{
-			KeyHandle: tpm2.AuthHandle{
-				Handle: k.t.loadedHandle,
-				Name: tpm2.TPM2BName{
-					Buffer: []byte(k.id),
-				},
-				Auth: tpm2.PasswordAuth(k.t.objectAuth),
-			},
-			Message: tpm2.TPM2BMaxBuffer{
-				Buffer: cleartext,
-			},
-			Decrypt: false,
-			IV: tpm2.TPM2BIV{
-				Buffer: iv,
-			},
-		}.Execute(k.t.tpm)
-		if err != nil {
-			return nil, fmt.Errorf("TPM2_EncryptDecrypt2: %w", err)
-		}
-		enc := resp.OutData.Buffer
-		out := make([]byte, len(iv)+len(enc))
-		copy(out, iv)
-		copy(out[len(iv):], enc)
-		return out, nil
+		return k.aesEncryptLocked(cleartext)
 
 	default:
 		return nil, ErrWrongKeyType
@@ -957,33 +940,111 @@ func (k *Key) Decrypt(_ io.Reader, ciphertext []byte, _ crypto.DecrypterOpts) (p
 		return resp.Message.Buffer, nil
 
 	case TypeAES:
-		if len(ciphertext) < 16 {
-			return nil, ErrDecrypt
-		}
-		resp, err := tpm2.EncryptDecrypt2{
-			KeyHandle: tpm2.AuthHandle{
-				Handle: k.t.loadedHandle,
-				Name: tpm2.TPM2BName{
-					Buffer: []byte(k.id),
-				},
-				Auth: tpm2.PasswordAuth(k.t.objectAuth),
-			},
-			Message: tpm2.TPM2BMaxBuffer{
-				Buffer: ciphertext[16:],
-			},
-			Decrypt: true,
-			IV: tpm2.TPM2BIV{
-				Buffer: ciphertext[:16],
-			},
-		}.Execute(k.t.tpm)
-		if err != nil {
-			return nil, fmt.Errorf("TPM2_EncryptDecrypt2: %w", err)
-		}
-		return resp.OutData.Buffer, nil
+		return k.aesDecryptLocked(ciphertext)
 
 	default:
 		return nil, ErrWrongKeyType
 	}
+}
+
+// AES ciphertext format:
+//
+//	version (1) || iv (16) || wrapped data key (32) || AES-GCM ciphertext+tag
+//
+// A random data key is generated for each message and wrapped (AES-CFB) by the
+// TPM key. The message itself is sealed with AES-GCM in software, using a key
+// derived from the data key. The data key is never reused, so a fixed nonce is
+// safe. The header is authenticated as additional data.
+const (
+	aesVersion    = 1
+	aesIVSize     = 16
+	aesDataKeyLen = 32
+	aesHeaderSize = 1 + aesIVSize + aesDataKeyLen
+)
+
+func (k *Key) aesEncryptLocked(cleartext []byte) ([]byte, error) {
+	header := make([]byte, aesHeaderSize)
+	header[0] = aesVersion
+	iv := header[1 : 1+aesIVSize]
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return nil, fmt.Errorf("rand: %w", err)
+	}
+	dataKey := make([]byte, aesDataKeyLen)
+	if _, err := io.ReadFull(rand.Reader, dataKey); err != nil {
+		return nil, fmt.Errorf("rand: %w", err)
+	}
+	wrapped, err := k.tpmAESLocked(dataKey, iv, false)
+	if err != nil {
+		return nil, err
+	}
+	if len(wrapped) != aesDataKeyLen {
+		return nil, errors.New("TPM2_EncryptDecrypt2: unexpected output size")
+	}
+	copy(header[1+aesIVSize:], wrapped)
+
+	aead, err := newDataKeyAEAD(dataKey)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	return aead.Seal(header, nonce, cleartext, header), nil
+}
+
+func (k *Key) aesDecryptLocked(ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) < aesHeaderSize || ciphertext[0] != aesVersion {
+		return nil, ErrDecrypt
+	}
+	header := ciphertext[:aesHeaderSize]
+	iv := header[1 : 1+aesIVSize]
+	dataKey, err := k.tpmAESLocked(header[1+aesIVSize:], iv, true)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := newDataKeyAEAD(dataKey)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	out, err := aead.Open(nil, nonce, ciphertext[aesHeaderSize:], header)
+	if err != nil {
+		return nil, ErrDecrypt
+	}
+	return out, nil
+}
+
+func newDataKeyAEAD(dataKey []byte) (cipher.AEAD, error) {
+	key, err := hkdf.Key(sha256.New, dataKey, nil, "github.com/c2FmZQ/tpm AES-GCM", 32)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func (k *Key) tpmAESLocked(in, iv []byte, decrypt bool) ([]byte, error) {
+	resp, err := tpm2.EncryptDecrypt2{
+		KeyHandle: tpm2.AuthHandle{
+			Handle: k.t.loadedHandle,
+			Name: tpm2.TPM2BName{
+				Buffer: []byte(k.id),
+			},
+			Auth: tpm2.PasswordAuth(k.t.objectAuth),
+		},
+		Message: tpm2.TPM2BMaxBuffer{
+			Buffer: in,
+		},
+		Decrypt: decrypt,
+		IV: tpm2.TPM2BIV{
+			Buffer: iv,
+		},
+	}.Execute(k.t.tpm)
+	if err != nil {
+		return nil, fmt.Errorf("TPM2_EncryptDecrypt2: %w", err)
+	}
+	return resp.OutData.Buffer, nil
 }
 
 func (t *TPM) srk() (tpm2.NamedHandle, func(), error) {
