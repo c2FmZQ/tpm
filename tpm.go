@@ -30,6 +30,13 @@
 //
 // By default, 2048-bit RSA keys are created. AES keys, ECC keys, HMAC keys, and
 // RSA keys of different sizes can also be created if the TPM supports them.
+//
+// Keys are created under a storage root key (SRK) in the owner hierarchy, so
+// clearing the TPM invalidates them. All commands that use keys are protected
+// by HMAC sessions salted with the SRK: auth values are never sent to the TPM
+// in cleartext, secret parameters are encrypted, and responses are
+// authenticated. Serialized keys are bound to the SRK that they were created
+// under.
 package tpm
 
 import (
