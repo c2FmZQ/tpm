@@ -778,7 +778,7 @@ func (k *Key) parsePublic(outPublic *tpm2.TPMTPublic) error {
 // Marshal returns the serialized version of the key, which can be stored
 // offline, and later unmarshaled with [TPM.UnmarshalKey].
 func (k *Key) Marshal() ([]byte, error) {
-	return k.keyb, nil
+	return slices.Clone(k.keyb), nil
 }
 
 // Public returns the public key.

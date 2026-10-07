@@ -411,7 +411,12 @@ func TestMarshal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("key.Marshal: %v", err)
 		}
-		contexts = append(contexts, b)
+		contexts = append(contexts, slices.Clone(b))
+		// The caller owns the returned slice.
+		clear(b)
+		if b2, _ := key.Marshal(); !bytes.Equal(b2, contexts[i]) {
+			t.Fatal("Modifying the output of key.Marshal changed the key")
+		}
 
 		payload := []byte(fmt.Sprintf("Payload %d", i))
 		enc, err := key.Encrypt(payload)
